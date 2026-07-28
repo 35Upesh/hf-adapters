@@ -53,7 +53,7 @@ sys.path.insert(0, str(project_root))
 from utils.fetch_top_embedding_models import fetch_top_embedding_models  # noqa: E402
 from utils.fetch_top_generative_models import fetch_top_generative_models  # noqa: E402
 
-MODES = ("generative", "embedding")
+MODEL_TYPES = ("generative", "embedding")
 
 
 def _chunk(rows: list[dict], shard_size: int) -> list[list[dict]]:
@@ -88,19 +88,27 @@ def generate_shards(
     x2_shard_size: int,
     x4_shard_size: int,
     output_dir: Path,
+    model_types: tuple[str, ...] = MODEL_TYPES,
 ) -> list[dict]:
-    """Fetch both mode's top-K lists once, write shard JSON files, and return
-    the combined matrix (list of {mode, shard_index, shard_file, runner} dicts).
+    """Fetch each requested mode's top-K list once, write shard JSON files,
+    and return the combined matrix (list of {mode, shard_index, shard_file,
+    runner} dicts).
 
     Within each mode, models are split into three parameter-count tiers (see
     module docstring), each chunked at its own shard size and tagged with
     the runner ("x1"/"x2"/"x4") that ends up handling it.
+
+    *model_types* restricts which of MODEL_TYPES to fetch/shard — used by
+    workflow_dispatch's model_type input so a manual run can scan just
+    embedding models (much quicker, less resource-hungry) without the
+    schedule-triggered full scan having to change.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    fetchers = {
+    all_fetchers = {
         "generative": (fetch_top_generative_models, shard_size_generative),
         "embedding": (fetch_top_embedding_models, shard_size_embedding),
     }
+    fetchers = {model_type: all_fetchers[model_type] for model_type in model_types}
 
     matrix: list[dict] = []
     for mode, (fetch_fn, shard_size) in fetchers.items():
@@ -212,7 +220,17 @@ def main() -> None:
         default=Path("shards"),
         help="Directory to write shard JSON files into.",
     )
+    parser.add_argument(
+        "--model-type",
+        choices=("all", *MODEL_TYPES),
+        default="all",
+        help="Restrict the scan to one mode (e.g. 'embedding' for a quick, "
+        "low-resource manual run). 'all' (the default, and what the "
+        "scheduled run always uses) fetches/shards both model-types.",
+    )
     args = parser.parse_args()
+
+    model_types = MODEL_TYPES if args.model_type == "all" else (args.model_type,)
 
     matrix = generate_shards(
         top_k=args.top_k,
@@ -223,10 +241,24 @@ def main() -> None:
         x2_shard_size=args.x2_shard_size,
         x4_shard_size=args.x4_shard_size,
         output_dir=args.output_dir,
+        model_types=model_types,
     )
 
-    print(f"\nTotal shards across both modes: {len(matrix)}")
-    write_github_output({"matrix": json.dumps(matrix)})
+    print(f"\nTotal shards across both model-types: {len(matrix)}")
+
+    # Split by runner tier so push-to-clickhouse.yaml's three per-tier jobs
+    # can each cap strategy.max-parallel in cards (x1=1, x2=2, x4=4/shard).
+    matrix_by_tier: dict[str, list[dict]] = {"x1": [], "x2": [], "x4": []}
+    for item in matrix:
+        matrix_by_tier[item["runner"]].append(item)
+
+    write_github_output(
+        {
+            "matrix_x1": json.dumps(matrix_by_tier["x1"]),
+            "matrix_x2": json.dumps(matrix_by_tier["x2"]),
+            "matrix_x4": json.dumps(matrix_by_tier["x4"]),
+        }
+    )
 
 
 if __name__ == "__main__":
