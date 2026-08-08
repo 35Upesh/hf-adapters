@@ -115,6 +115,7 @@ def _process_batch(
             "error": None,
             "failure_category": None,
         }
+        print(f"{ts()} - {model_path} " + ("\t(curated)" if row["curated"] else ""))
         try:
             try:
                 adapter_module = resolve_adapter_module_for_test(model_path)
