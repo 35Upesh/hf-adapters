@@ -61,6 +61,7 @@ from transformers import (
     Granite4VisionConfig,
     GraniteConfig,
     GraniteMoeHybridConfig,
+    GraniteSWAConfig,
     LlamaConfig,
     MistralConfig,
     ModernBertConfig,
@@ -92,6 +93,7 @@ from hf_adapters import (
     hf_gpt_neo,
     hf_gpt_neox,
     hf_granite,
+    hf_granite_swa,
     hf_granite_vision,
     hf_granite_vision_mm,
     hf_granitemoehybrid,
@@ -133,6 +135,7 @@ CONFIG_TO_ADAPTER_MODULE_MAPPING: dict[type[PretrainedConfig], ModuleType] = {
     Granite4VisionConfig: hf_granite_vision,
     GraniteConfig: hf_granite,
     GraniteMoeHybridConfig: hf_granitemoehybrid,
+    GraniteSWAConfig: hf_granite_swa,
     LlamaConfig: hf_llama,
     MistralConfig: hf_mistral,
     MinistralConfig: hf_ministral,
@@ -194,6 +197,7 @@ MODEL_PATH_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
     "google/gemma-4-31b": torch.bfloat16,
     "ibm-granite/granite-4.0-1b-base": torch.float32,
     "ibm-granite/granite-4.0-1b": torch.float32,
+    "ibm-research/granite-4.1-20b": torch.bfloat16,
 }
 
 

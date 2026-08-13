@@ -103,6 +103,13 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_granitemoehybrid.py",
         "size": "8b",
     },
+    # hf_granite_swa.py
+    "granite41_20b": {
+        "name": "Granite 4.1 20B",
+        "path": "ibm-research/granite-4.1-20b",
+        "adapter": "hf_granite_swa.py",
+        "size": "20b",
+    },
     # hf_granite_vision.py
     "granite-vision": {
         "name": "Granite Vision 4.1 4B",
