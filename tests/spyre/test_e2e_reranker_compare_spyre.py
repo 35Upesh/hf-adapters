@@ -35,13 +35,13 @@ Usage (on Spyre LPAR)::
 
 import pytest
 import torch
-from _seq_classification_helpers import run_seq_classification_cpu_vs_spyre
-from model_registry import RERANKER_PATHS
 
 from hf_adapters.auto_spyre_model import (
     SEQUENCE_CLASSIFICATION_CONFIG_TO_ADAPTER_MODULE_MAPPING,
     resolve_adapter_module,
 )
+from tests.model_registry import RERANKER_PATHS
+from tests.spyre._seq_classification_helpers import run_seq_classification_cpu_vs_spyre
 
 pytestmark = pytest.mark.model_harness("reranker")
 

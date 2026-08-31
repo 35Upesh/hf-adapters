@@ -37,7 +37,8 @@ import time
 from typing import Any
 
 import pytest
-from model_registry import (
+
+from tests.model_registry import (
     CAUSAL_PATHS,
     EMBED_PATHS,
     MASKED_LM_PATHS,
