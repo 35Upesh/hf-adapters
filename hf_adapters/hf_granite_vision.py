@@ -25,8 +25,7 @@ block and backbone forward are reused from ``hf_granite``. The only differences
 from the bare-Granite causal adapter are checkpoint-shape details that the
 shared helpers already handle (``get_backbone`` descends to
 ``model.model.language_model``; ``text_config`` reads the nested text dims):
-this adapter just patches the VLM's own ``Granite4VisionTextRMSNorm`` and reads
-``logits_scaling`` from the nested ``text_config``.
+this adapter just reads ``logits_scaling`` from the nested ``text_config``.
 
 Usage::
 
@@ -36,20 +35,22 @@ Usage::
     model = AutoSpyreModelForCausalLM.from_pretrained(
         "ibm-granite/granite-vision-4.1-4b")
     tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-vision-4.1-4b")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
 
+from hf_adapters import hf_granite
 from hf_adapters.hf_common import (
     get_backbone,
-    make_standard_gqa_block,
     pad_lm_head,
-    patch_rmsnorm,
     prepare_rope_and_heads,
-    text_config,
+    prepare_standard_gqa_blocks,
 )
-from hf_adapters.hf_granite import _run_backbone_forward
+
+_run_backbone_forward = hf_granite._run_backbone_forward
+_run_forward = hf_granite._run_forward
 
 
 def load_hf_model(model_path, dtype=torch.float16):
@@ -81,49 +82,11 @@ def prepare_for_spyre(model):
 
     Mirrors ``hf_granite.prepare_for_spyre`` against the VLM's nested text
     backbone: the shared RoPE/head prep and LM-head padding descend via
-    ``get_backbone``/``text_config`` on their own, so the only VLM-specific step
-    is patching the decoder's ``Granite4VisionTextRMSNorm`` (not Granite 3.3's
-    ``GraniteRMSNorm``). The vision tower is left untouched — this is the
-    text-only path.
+    ``get_backbone``/``text_config`` on their own. The vision tower is left
+    untouched — this is the text-only path.
     """
-    from transformers.models.granite4_vision.modeling_granite4_vision import (
-        Granite4VisionTextRMSNorm,
-    )
-
     prepare_rope_and_heads(model)
-    patch_rmsnorm(Granite4VisionTextRMSNorm)
     pad_lm_head(model)
-    model._spyre_compiled_blocks = [
-        make_standard_gqa_block(layer, True) for layer in get_backbone(model).layers
-    ]
-
-
-def _run_forward(
-    model,
-    input_ids,
-    position_ids,
-    attn_mask,
-    key_caches,
-    value_caches,
-    is_filling,
-    token_index,
-    cache_position,
-):
-    """Granite Vision text causal-LM forward: backbone + head / scaling.
-
-    Identical to ``hf_granite._run_forward`` except ``logits_scaling`` lives on
-    the nested ``text_config`` rather than the top-level VLM config.
-    """
-    h = _run_backbone_forward(
-        model,
-        input_ids,
-        position_ids,
-        attn_mask,
-        key_caches,
-        value_caches,
-        is_filling,
-        token_index,
-        cache_position,
-    )
-    logits = model.lm_head(h)
-    return logits / text_config(model.config).logits_scaling
+    backbone = get_backbone(model)
+    model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
+    model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)

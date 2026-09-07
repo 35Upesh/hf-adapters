@@ -1,29 +1,16 @@
-#!/usr/bin/env python3
-"""
-Creates or drops the model_spyre_support table in ClickHouse.
+"""ClickHouse client factory for the model_spyre_support tables.
 
-Columns:
-  - model_name         (String)   – unique model identifier
-  - config_class       (String)   – model config_class (e.g. BertConfig, Qwen3Config)
-  - adapter_name       (String)   – adapter name (e.g. hf_bert, hf_gemma4)
-  - added_date         (Date?)    – date the adapter was added to the git repo (optional - None if not existing)
-  - snapshot_date      (Date)     – date this weekly snapshot was taken
-  - verified_on_cpu    (Bool)     – passes on CPU
-  - verified_on_gpu    (Bool)     – passes on GPU
-  - verified_on_spyre  (Bool)     – passes on Spyre
-  - num_downloads      (UInt64)   – number of downloads
-  - family             (String)   – model family reported by the catalog
-  - architecture       (String)   – model architecture reported by the catalog
-  - parameters_number  (UInt64)   – number of model parameters
-  - failure_category   (String?)  – classification for failures (optional - None if model passed)
-  - error              (String?)  – error message if the model failed (optional - None if model passed)
+The table shape itself lives in ``table_schema`` — a leaf module with no
+dependencies — and is re-exported here so existing callers keep working. Import
+from ``table_schema`` directly when you only need the column list or DDL:
+importing *this* module pulls in ``clickhouse_connect`` and reads ``.env`` off
+disk, neither of which a consumer of a column tuple should have to pay for.
 
-Credentials are loaded from a .env file at the repo root (two levels above this
-script), then fall back to environment variables already set in the shell.
-Copy .env.example → .env and fill in the values before running.
+Credentials are loaded from a .env file at the repo root, then fall back to
+environment variables already set in the shell. Copy .env.example → .env and fill
+in the values before running.
 
   CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASS, CLICKHOUSE_DB
-
 """
 
 import os
@@ -33,8 +20,29 @@ from pathlib import Path
 import clickhouse_connect
 from dotenv import load_dotenv
 
-# Locate the repo root (.env lives two directories above this script:
-#   repo_root/.github/scripts/clickhouse_db.py)
+# Re-exported for backwards compatibility; table_schema is the source of truth.
+from tests.spyre.weekly_generation.table_schema import (
+    DATABASE,
+    EMBEDDING_CREATE_TABLE_SQL,
+    EMBEDDING_TABLE_NAME,
+    GENERATIVE_CREATE_TABLE_SQL,
+    GENERATIVE_TABLE_NAME,
+    TABLE_COLUMNS,
+)
+
+__all__ = [
+    "DATABASE",
+    "EMBEDDING_CREATE_TABLE_SQL",
+    "EMBEDDING_TABLE_NAME",
+    "GENERATIVE_CREATE_TABLE_SQL",
+    "GENERATIVE_TABLE_NAME",
+    "TABLE_COLUMNS",
+    "get_client",
+    "table_exists",
+]
+
+# Locate the repo root (.env lives three directories above this module:
+#   repo_root/tests/spyre/weekly_generation/clickhouse_db.py)
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
@@ -50,61 +58,6 @@ def get_client():
     )
 
 
-EMBEDDING_TABLE_NAME = "embedding_model_spyre_support"
-GENERATIVE_TABLE_NAME = "generative_model_spyre_support"
-DATABASE = "spyre"
-
-# Single source of truth for the Python-facing column list. Order matches the
-# CREATE TABLE DDL below and the positional values used by insert_model_row —
-# keep the three in sync when adding columns.
-TABLE_COLUMNS: tuple[str, ...] = (
-    "model_name",
-    "config_class",
-    "adapter_name",
-    "added_date",
-    "snapshot_date",
-    "verified_on_cpu",
-    "verified_on_gpu",
-    "verified_on_spyre",
-    "num_downloads",
-    "family",
-    "architecture",
-    "parameters_number",
-    "failure_category",
-    "error",
-)
-
-
-def _make_create_table_sql(table_name: str) -> str:
-    return f"""
-CREATE TABLE IF NOT EXISTS {DATABASE}.{table_name}
-(
-    model_name        String,
-    config_class      String,
-    adapter_name      String,
-    added_date        Nullable(Date),
-    snapshot_date     Date,
-    verified_on_cpu   Bool,
-    verified_on_gpu   Bool,
-    verified_on_spyre Bool,
-    num_downloads     UInt64,
-    family            String,
-    architecture      String,
-    parameters_number UInt64,
-    failure_category  Nullable(String),
-    error             Nullable(String)
-)
-ENGINE = ReplacingMergeTree(snapshot_date)
-ORDER BY (model_name, snapshot_date)
-"""
-
-
-# The column names and order below MUST match ``TABLE_COLUMNS`` above.
-# When adding/removing/renaming a column, update both in the same change.
-EMBEDDING_CREATE_TABLE_SQL = _make_create_table_sql(EMBEDDING_TABLE_NAME)
-GENERATIVE_CREATE_TABLE_SQL = _make_create_table_sql(GENERATIVE_TABLE_NAME)
-
-
 def table_exists(client, table_name: str) -> bool:
     result = client.query(
         "SELECT count() FROM system.tables "
@@ -114,90 +67,61 @@ def table_exists(client, table_name: str) -> bool:
     return result.result_rows[0][0] > 0
 
 
-def print_table(client, table_name: str) -> None:
-    result = client.query(
-        "SELECT name, type FROM system.columns "
-        "WHERE database = {db:String} AND table = {tbl:String} "
-        "ORDER BY position",
-        parameters={"db": DATABASE, "tbl": table_name},
-    )
-    print(f"Table '{DATABASE}.{table_name}' already exists with columns:")
-    for col_name, col_type in result.result_rows:
-        print(f"  {col_name:<25} {col_type}")
-
-
-def insert_model_row(
-    client,
-    *,
-    table_name: str,
-    model_name: str,
-    config_class: str,
-    adapter_name: str,
-    added_date: date | None,
-    snapshot_date: date,
-    verified_on_cpu: bool,
-    verified_on_gpu: bool,
-    verified_on_spyre: bool,
-    num_downloads: int,
-    family: str,
-    architecture: str,
-    parameters_number: int,
-    failure_category: str | None,
-    error: str | None,
-) -> bool:
-    """Insert a single row into the given table.
-
-    The caller is responsible for any duplicate-suppression guard (e.g.
-    ``ResultSink.should_insert_row``). This function always writes.
-    """
-    client.insert(
-        table_name,
-        [
-            [
-                model_name,
-                config_class,
-                adapter_name,
-                added_date,
-                snapshot_date,
-                verified_on_cpu,
-                verified_on_gpu,
-                verified_on_spyre,
-                num_downloads,
-                family,
-                architecture,
-                parameters_number,
-                failure_category,
-                error,
-            ]
-        ],
-        column_names=list(TABLE_COLUMNS),
-    )
-    return True
-
-
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes")
 
 
+def _parse_date(value: str) -> date:
+    """Parse a date string in either ISO (YYYY-MM-DD) or US (MM/DD/YYYY) format."""
+    v = value.strip()
+    if "/" in v:
+        return date(*(int(x) for x in reversed(v.split("/"))))
+    return date.fromisoformat(v)
+
+
+_NULL_SENTINELS = {"", "\\n", "\\N", "null", "none", "na", "n/a"}
+
+
 def _parse_nullable_date(value: str | None) -> date | None:
     v = (value or "").strip()
-    return date.fromisoformat(v) if v else None
+    return _parse_date(v) if v.lower() not in _NULL_SENTINELS else None
 
 
 def _parse_nullable_str(value: str | None) -> str | None:
     v = (value or "").strip()
-    return v if v else None
+    return v if v.lower() not in _NULL_SENTINELS else None
 
 
-def import_csv(sink, csv_path: str) -> tuple[int, int]:
+def _parse_int(value: str | None) -> int:
+    """Parse an integer, tolerating scientific notation and NULL sentinels.
+
+    ``int(s)`` rejects any string containing ``.`` or ``e``, but some CSV
+    exporters (spreadsheets in particular) render large UInt64 values in
+    scientific form. Route through ``float`` first so those parse. Empty
+    input and ClickHouse's ``\\N`` NULL sentinel map to 0, since the target
+    columns (num_downloads, parameters_number) are non-nullable UInt64.
+    """
+    v = (value or "").strip()
+    if not v or v.lower() in _NULL_SENTINELS:
+        return 0
+    try:
+        return int(v)
+    except ValueError:
+        return int(float(v))
+
+
+def import_csv(sink, csv_path: str, flush_every: int = 5000) -> tuple[int, int]:
     """Read *csv_path* and insert rows into *sink*, respecting its dedup guard.
 
     Uses ``sink.add_entry()`` so ``should_insert_row`` is applied for every row.
-    Returns a ``(inserted, skipped)`` tuple.
+    Flushes the sink every *flush_every* buffered rows so a large CSV does not
+    accumulate into a single multi-hundred-thousand-row INSERT that overruns the
+    HTTP write timeout. Returns an ``(inserted, skipped)`` tuple.
     """
     import csv
 
     inserted = skipped = malformed = 0
+    buffered_since_flush: int = 0
     with open(csv_path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
@@ -212,7 +136,7 @@ def import_csv(sink, csv_path: str) -> tuple[int, int]:
                 )
                 continue
             try:
-                snapshot_date_val: date = date.fromisoformat(snapshot_raw)
+                snapshot_date_val: date = _parse_date(snapshot_raw)
             except ValueError:
                 malformed += 1
                 print(
@@ -230,17 +154,20 @@ def import_csv(sink, csv_path: str) -> tuple[int, int]:
                 verified_on_cpu=_parse_bool(row.get("verified_on_cpu") or ""),
                 verified_on_gpu=_parse_bool(row.get("verified_on_gpu") or ""),
                 verified_on_spyre=_parse_bool(row.get("verified_on_spyre") or ""),
-                num_downloads=int((row.get("num_downloads") or "0").strip() or "0"),
+                curated=_parse_bool(row.get("curated") or ""),
+                num_downloads=_parse_int(row.get("num_downloads")),
                 family=(row.get("family") or "").strip(),
                 architecture=(row.get("architecture") or "").strip(),
-                parameters_number=int(
-                    (row.get("parameters_number") or "0").strip() or "0"
-                ),
+                parameters_number=_parse_int(row.get("parameters_number")),
                 failure_category=_parse_nullable_str(row.get("failure_category")),
                 error=_parse_nullable_str(row.get("error")),
             )
             if written:
                 inserted += 1
+                buffered_since_flush += 1
+                if buffered_since_flush >= flush_every:
+                    sink.flush()
+                    buffered_since_flush = 0
             else:
                 skipped += 1
 
@@ -253,11 +180,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="ClickHouse table management utility.")
-    parser.add_argument(
-        "--drop",
-        metavar="TABLE_NAME",
-        help="Drop the specified table after confirmation.",
-    )
 
     add_csv_group = parser.add_argument_group("import CSV")
     add_csv_group.add_argument(
@@ -265,6 +187,16 @@ if __name__ == "__main__":
     )
     add_csv_group.add_argument(
         "--table_name", metavar="TABLE_NAME", help="Target table for --add_csv."
+    )
+    add_csv_group.add_argument(
+        "--flush_every",
+        metavar="N",
+        type=int,
+        default=5000,
+        help=(
+            "Flush the sink every N inserted rows (default 5000). Lower this if "
+            "the server times out on the bulk INSERT; raise it for fewer round trips."
+        ),
     )
 
     args = parser.parse_args()
@@ -274,41 +206,25 @@ if __name__ == "__main__":
             parser.error("--add_csv and --table_name must be used together.")
         csv_file = args.add_csv
         table = args.table_name
-        # Lazy import to avoid a circular dependency (result_sink imports from this module).
-        from tests.spyre.weekly_generation.result_sink import (
+        # Lazy import to avoid a circular dependency (clickhouse_sink imports from this module).
+        from tests.spyre.weekly_generation.model_type import ModelType
+        from tests.spyre.weekly_generation.sink.clickhouse_sink import (
             ClickHouseResultSink,
-            EmbeddingGenerativeMode,
         )
 
         if table == EMBEDDING_TABLE_NAME:
-            mode = EmbeddingGenerativeMode.EMBEDDING
+            mode = ModelType.EMBEDDING
         elif table == GENERATIVE_TABLE_NAME:
-            mode = EmbeddingGenerativeMode.GENERATIVE
+            mode = ModelType.GENERATIVE
         else:
             parser.error(
                 f"Unknown table '{table}'. Expected one of: "
                 f"{EMBEDDING_TABLE_NAME}, {GENERATIVE_TABLE_NAME}."
             )
         with ClickHouseResultSink(mode) as sink:
-            inserted, skipped = import_csv(sink, csv_file)
+            inserted, skipped = import_csv(sink, csv_file, flush_every=args.flush_every)
         print(
             f"Inserted {inserted} row(s) into '{DATABASE}.{table}' ({skipped} skipped by dedup guard)."
         )
-    elif args.drop:
-        table = args.drop
-        answer = (
-            input(f"Are you sure you want to drop table '{DATABASE}.{table}'? [y/N] ")
-            .strip()
-            .lower()
-        )
-        if answer == "y":
-            client = get_client()
-            if not table_exists(client, table):
-                print(f"Table '{DATABASE}.{table}' does not exist.")
-            else:
-                client.command(f"DROP TABLE {DATABASE}.{table}")
-                print(f"Table '{DATABASE}.{table}' dropped.")
-        else:
-            print("Aborted.")
     else:
         parser.print_help()

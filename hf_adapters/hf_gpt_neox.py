@@ -44,7 +44,8 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("EleutherAI/pythia-70m")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
@@ -58,7 +59,6 @@ from hf_adapters.hf_common import (
     _pad_proj_input_simple,
     _pad_proj_output_simple,
     apply_rope_matmul,
-    assert_spyre_dimensions,
     get_backbone,
     kv_cache_update,
     pad_lm_head,
@@ -142,9 +142,7 @@ def _make_compiled_block(layer, q_proj, k_proj, v_proj, head_dim, num_heads, sca
         attn_mask,
         key_cache,
         value_cache,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     ):
         residual = hidden_states
 
@@ -161,7 +159,7 @@ def _make_compiled_block(layer, q_proj, k_proj, v_proj, head_dim, num_heads, sca
         k = apply_rope_matmul(k, selected_freqs)
 
         key_cache, value_cache = kv_cache_update(
-            k, v, key_cache, value_cache, is_filling, token_index, cache_position
+            k, v, key_cache, value_cache, cache_index
         )
 
         attn_out = F.scaled_dot_product_attention(
@@ -195,9 +193,7 @@ def _run_backbone_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """GPT-NeoX backbone: token embedding, RoPE, compiled blocks, final_layer_norm."""
     bb = get_backbone(model)
@@ -211,9 +207,7 @@ def _run_backbone_forward(
             attn_mask,
             key_caches[i],
             value_caches[i],
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
     h = bb.final_layer_norm(h)
@@ -227,9 +221,7 @@ def _run_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """GPT-NeoX causal-LM forward: backbone + LM head."""
     h = _run_backbone_forward(
@@ -239,9 +231,7 @@ def _run_forward(
         attn_mask,
         key_caches,
         value_caches,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     )
     logits = model._spyre_lm_head(h)
     return logits[..., : model.config.vocab_size]
@@ -255,10 +245,6 @@ def prepare_for_spyre(model):
     pads the LM head, and compiles one block per layer.
     """
     cfg = model.config
-    assert_spyre_dimensions(
-        cfg, model_name=getattr(cfg, "name_or_path", "") or "gpt-neox"
-    )
-
     bb = get_backbone(model)
     num_heads = cfg.num_attention_heads
     hidden = cfg.hidden_size

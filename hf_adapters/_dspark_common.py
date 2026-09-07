@@ -34,9 +34,9 @@ Because of the block-propose shape, the adapter's public forward is
 token-by-token ``_run_forward``/``generate`` surface of a target adapter. The
 family adapters wire ``prepare_for_spyre`` (below) + a thin ``_run_draft_block``.
 
-Everything Spyre-specific reuses ``hf_common``: ``patch_rmsnorm`` (pow → x*x),
-``pad_lm_head`` (stick-padded single-kernel head, for the draft head AND the
-markov ``w2``), ``PrecomputedRotaryEmbedding`` + ``apply_rope_matmul`` (RoPE),
+Everything Spyre-specific reuses ``hf_common``: ``pad_lm_head`` (stick-padded
+single-kernel head, for the draft head AND the markov ``w2``),
+``PrecomputedRotaryEmbedding`` + ``apply_rope_matmul`` (RoPE),
 and the "compute-on-CPU, move to device" idiom for the embedding lookup and the
 markov sample loop. The two things with no ready-made helper — the concat-KV
 non-causal block and the markov sample loop — live here.
@@ -51,7 +51,6 @@ from hf_adapters.hf_common import (
     PrecomputedRotaryEmbedding,
     apply_rope_matmul,
     pad_lm_head,
-    patch_rmsnorm,
 )
 
 
@@ -174,11 +173,9 @@ def make_dspark_block(
     return torch.compile(block_forward, dynamic=False)
 
 
-def prepare_dspark_common(model, rmsnorm_cls, *, ctx_pad, kv_pad, use_qk_norm):
+def prepare_dspark_common(model, *, ctx_pad, kv_pad, use_qk_norm):
     """Shared ``prepare_for_spyre`` steps for a DSpark drafter.
 
-    - patch the family RMSNorm (pow → x*x) — covers layer norms, ``hidden_norm``,
-      and any q/k norm;
     - stick-pad the draft ``lm_head`` and the markov ``markov_w2`` (both are
       full-vocab matmuls that would otherwise overflow the per-core EAR limit);
     - precompute RoPE and build the compiled concat-KV blocks.
@@ -187,10 +184,9 @@ def prepare_dspark_common(model, rmsnorm_cls, *, ctx_pad, kv_pad, use_qk_norm):
     ``inv_freq`` rotary used by Qwen3/Granite). A family whose rotary source differs
     may pre-set ``model._spyre_rope`` before calling this (e.g. Gemma4 wraps its
     per-attention-type ``full_attention_inv_freq`` via ``InvFreqShim``); an already
-    set ``_spyre_rope`` is left untouched. The caller also passes its RMSNorm class
-    and may stash an attention-scaling override on ``model._spyre_attn_scaling``.
+    set ``_spyre_rope`` is left untouched. The caller may stash an
+    attention-scaling override on ``model._spyre_attn_scaling``.
     """
-    patch_rmsnorm(rmsnorm_cls)
     pad_lm_head(model)
     _pad_markov_w2(model)
     snapshot_cpu_embeddings(model)
@@ -261,8 +257,8 @@ def snapshot_cpu_embeddings(model):
     """Keep CPU copies of the gather-only embedding weights.
 
     ``nn.Embedding`` is a gather with no Spyre kernel (CPU fallback), so the
-    noise-block and markov ``w1`` lookups must run on CPU. But
-    ``_move_to_spyre_with_layout`` (which runs AFTER ``prepare_for_spyre``) moves
+    noise-block and markov ``w1`` lookups must run on CPU. But the device move
+    via ``load_model_to_spyre`` (which runs AFTER ``prepare_for_spyre``) moves
     every parameter — including these embeddings — onto the Spyre device, which
     would collide CPU ids with a Spyre weight. Snapshot the weights on CPU here so
     the lookups are device-independent of where the move leaves the module; the
@@ -315,7 +311,7 @@ def snapshot_cpu_fc(model):
     tensor, off the autoregressive loop, so we run it on CPU (fp32, exact) and
     return the result on device — the same host boundary spyre_draft.py used, and
     analogous to the RoPE / embedding CPU fallbacks. Snapshot the weights here so
-    the projection is independent of where ``_move_to_spyre_with_layout`` leaves
+    the projection is independent of where the Spyre device move leaves
     ``fc``/``hidden_norm``.
     """
     fc = getattr(model, "fc", None)
@@ -399,7 +395,7 @@ def install_spyre_markov(model):
     correction runs on host with only the ``w2`` matmul on-device — no device mix.
     No-op when the drafter has no markov head.
     """
-    from deepspec.utils.sampling import sample_tokens
+    from deepspec.utils.sampling import sample_tokens  # type: ignore[import-not-found]
 
     mh = getattr(model, "markov_head", None)
     if mh is None or not hasattr(mh, "markov_w2"):

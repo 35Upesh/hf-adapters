@@ -30,7 +30,8 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("microsoft/Phi-4-mini-instruct")
     tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-4-mini-instruct")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
@@ -47,7 +48,6 @@ from hf_adapters.hf_common import (
     kv_cache_update,
     pad_lm_head,
     pad_qk_proj_for_rope,
-    patch_rmsnorm,
     permute_proj_for_rope,
     rope_dim_permutation,
     split_fused_linear,
@@ -100,9 +100,7 @@ def _make_compiled_block(layer, q_proj, k_proj, v_proj, gate_proj, up_proj, head
         attn_mask,
         key_cache,
         value_cache,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     ):
         residual = hidden_states
         h = input_ln(hidden_states)
@@ -123,9 +121,7 @@ def _make_compiled_block(layer, q_proj, k_proj, v_proj, gate_proj, up_proj, head
             v,
             key_cache,
             value_cache,
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
         attn_out = F.scaled_dot_product_attention(
@@ -165,9 +161,7 @@ def _run_backbone_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """Phi-3 backbone: embedding, blocks, norm."""
     backbone = get_backbone(model)
@@ -181,12 +175,10 @@ def _run_backbone_forward(
             attn_mask,
             key_caches[i],
             value_caches[i],
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
-    h = backbone.norm(h)
+    h = model._spyre_compiled_norm(h)
     return h
 
 
@@ -197,9 +189,7 @@ def _run_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """Phi-3 causal-LM forward: backbone + LM head."""
     h = _run_backbone_forward(
@@ -209,9 +199,7 @@ def _run_forward(
         attn_mask,
         key_caches,
         value_caches,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     )
 
     return model.lm_head(h)
@@ -219,8 +207,6 @@ def _run_forward(
 
 def prepare_for_spyre(model):
     """Apply Spyre adaptations to Phi-3 model in-place."""
-    from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
-
     cfg = model.config
     hd = cfg.hidden_size // cfg.num_attention_heads
 
@@ -242,7 +228,6 @@ def prepare_for_spyre(model):
     model._spyre_rope = PrecomputedRotaryEmbedding(
         get_backbone(model).rotary_emb, padded_head_dim=work_hd
     )
-    patch_rmsnorm(Phi3RMSNorm)
 
     # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
     # the 256 MB EAR limit (see hf_common.pad_lm_head).
@@ -298,3 +283,4 @@ def prepare_for_spyre(model):
             model._spyre_up_projs,
         )
     ]
+    model._spyre_compiled_norm = torch.compile(get_backbone(model).norm, dynamic=False)

@@ -28,11 +28,11 @@ Unlike the RoPE decoders, GPT-2 uses:
   - a GELU MLP (``c_fc`` → ``gelu_new`` → ``c_proj``);
   - the backbone at ``model.transformer`` (not ``model.model``).
 
-``prepare_for_spyre`` rewrites every ``Conv1D`` into an ``nn.Linear`` (so the
-Spyre row-major matmul layout applies) and splits the fused ``c_attn`` into
-separate q/k/v linears, then compiles one block per layer via the shared
-``make_decoder_block`` (the non-RoPE causal-decoder factory, also used by the
-OPT/BLOOM/MPT family).
+``prepare_for_spyre`` rewrites every ``Conv1D`` into an ``nn.Linear`` (so
+``torch_spyre.model_utils.load_model_to_spyre`` can apply optimal Linear
+layout) and splits the fused ``c_attn`` into separate q/k/v linears, then
+compiles one block per layer via the shared ``make_decoder_block`` (the
+non-RoPE causal-decoder factory, also used by the OPT/BLOOM/MPT family).
 
 Usage::
 
@@ -41,13 +41,13 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch.nn as nn
 
 from hf_adapters.hf_common import (
-    assert_spyre_dimensions,
     get_backbone,
     make_decoder_block,
     pad_lm_head,
@@ -60,9 +60,9 @@ def _conv1d_to_linear(conv):
 
     ``Conv1D`` computes ``y = x @ W + b`` with ``W`` of shape ``[in, out]`` and
     ``b`` of shape ``[out]``. ``nn.Linear`` computes ``y = x @ W.T + b`` with
-    ``W`` of shape ``[out, in]``, so the weight is the transpose. Spyre's
-    row-major matmul layout (see ``_move_to_spyre_with_layout``) targets 2-D
-    ``nn.Linear`` weights, so we convert before moving to device.
+    ``W`` of shape ``[out, in]``, so the weight is the transpose.
+    ``load_model_to_spyre`` applies optimal layout only to ``nn.Linear``
+    weights, so we convert before moving to device.
     """
     in_features, out_features = conv.weight.shape
     linear = nn.Linear(in_features, out_features, bias=conv.bias is not None)
@@ -134,9 +134,7 @@ def _run_backbone_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """GPT-2 backbone: token + learned position embeddings, compiled blocks, ln_f.
 
@@ -154,9 +152,7 @@ def _run_backbone_forward(
             attn_mask,
             key_caches[i],
             value_caches[i],
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
     h = bb.ln_f(h)
@@ -170,9 +166,7 @@ def _run_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """GPT-2 causal-LM forward: backbone + LM head.
 
@@ -190,9 +184,7 @@ def _run_forward(
         attn_mask,
         key_caches,
         value_caches,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     )
     logits = model.lm_head(h)
     return logits[..., : model.config.vocab_size]
@@ -207,8 +199,6 @@ def prepare_for_spyre(model):
     positions.
     """
     cfg = model.config
-    assert_spyre_dimensions(cfg, model_name=getattr(cfg, "name_or_path", "") or "gpt2")
-
     bb = get_backbone(model)
     embed_dim = cfg.n_embd
 

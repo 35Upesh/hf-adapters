@@ -17,12 +17,9 @@ from pathlib import Path
 from typing import TypeVar
 
 from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub.hf_api import ModelInfo
+from huggingface_hub.hf_api import ExpandModelProperty_T, ModelInfo
 from tqdm import tqdm
 from transformers import AutoConfig
-
-# Import the mapping to get supported config classes dynamically
-from hf_adapters.auto_spyre_model import CONFIG_TO_ADAPTER_MODULE_MAPPING
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -30,8 +27,43 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # Get the resources directory (parent of resources/__init__.py)
 RESOURCES_DIR: Path = Path(__file__).resolve().parent.parent / "resources"
 
-# Metadata fields requested from list_models for every fetcher.
-EXPAND_FIELDS: list[str] = [
+# Manually-maintained model-id lists (one id per line; '#' comments and blank
+# lines ignored). See load_curated_model_ids().
+CURATED_GENERATIVE_MODELS_FILE: Path = RESOURCES_DIR / "generative_models_curated.txt"
+CURATED_EMBEDDING_MODELS_FILE: Path = RESOURCES_DIR / "embedding_models_curated.txt"
+
+
+def load_curated_model_ids(path: Path) -> list[str]:
+    """Load Hugging Face model ids from a curated list file.
+
+    The file holds one model id per line. Blank lines and lines whose first
+    non-whitespace character is ``#`` are ignored, as is any inline ``#``
+    comment following an id. Surrounding whitespace is stripped. Order is
+    preserved and duplicates are dropped (first occurrence wins).
+    """
+    seen: set[str] = set()
+    model_ids: list[str] = []
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        model_ids.append(line)
+    return model_ids
+
+
+def load_curated_generative_models() -> list[str]:
+    return load_curated_model_ids(CURATED_GENERATIVE_MODELS_FILE)
+
+
+def load_curated_embedding_models() -> list[str]:
+    return load_curated_model_ids(CURATED_EMBEDDING_MODELS_FILE)
+
+
+# Metadata fields requested from list_models/model_info for every fetcher.
+# Typed as the hub's own ExpandModelProperty_T literal rather than list[str], so a
+# typo here is a type error instead of a runtime 400 from the API.
+EXPAND_FIELDS: list[ExpandModelProperty_T] = [
     "config",
     "safetensors",
     "gated",
@@ -40,6 +72,7 @@ EXPAND_FIELDS: list[str] = [
     "createdAt",
     "library_name",
     "tags",
+    "siblings",
 ]
 
 # HF-API gateway 5xx statuses. Anything outside this set (400/401/403/404/...)
@@ -111,25 +144,13 @@ MOE_ARCH_SUBSTRINGS: list[str] = [
     "gptoss",
 ]
 
-# Get supported config class names dynamically from the mapping
-SUPPORTED_CONFIG_CLASSES: set[str] = {
-    config_class.__name__ for config_class in CONFIG_TO_ADAPTER_MODULE_MAPPING.keys()
-}
-
 
 def tags(model: ModelInfo) -> set[str]:
     """Lower-cased set of a model's tags (empty set if none)."""
     return {t.lower() for t in (getattr(model, "tags", None) or [])}
 
 
-def is_supported_config(config_class_name: str | None) -> bool:
-    """Check if the config class is supported by our adapter code."""
-    if config_class_name is None:
-        return False
-    return config_class_name in SUPPORTED_CONFIG_CLASSES
-
-
-def is_moe(model: ModelInfo) -> bool:
+def _is_moe(model: ModelInfo) -> bool:
     if any("moe" in t for t in tags(model)):
         return True
 
@@ -162,18 +183,31 @@ def is_nsfw(model: ModelInfo) -> bool:
 NON_NATIVE_ID_SUBSTRINGS: tuple[str, ...] = ("onnx", "gguf", "mlx")
 
 
-def is_baseline_keep(model: ModelInfo) -> bool:
-    """Shared inclusion gate: drop config-less, and ONNX/GGUF/MLX id checkpoints."""
-    if not model.config:
-        return False
+def is_baseline_keep(model: ModelInfo) -> tuple[bool, str]:
+    """Shared inclusion gate: drop config-less, and ONNX/GGUF/MLX id checkpoints.
+
+    Returns (keep, reason) where reason describes why the model was rejected
+    (empty string when kept).
+    """
+    failure_constant = "failed baseline keep: "
     if model.library_name in NON_NATIVE_ID_SUBSTRINGS:
-        return False
+        return False, failure_constant + "non-native library (ONNX/GGUF/MLX)"
     model_id_lower: str = model.id.lower()
     if any(sub in model_id_lower for sub in NON_NATIVE_ID_SUBSTRINGS):
-        return False
+        return False, failure_constant + "non-native format in model id (ONNX/GGUF/MLX)"
     if "nsfw" in tags(model):
-        return False
-    return True
+        return False, failure_constant + "NSFW tag"
+    if not model.config:
+        return False, failure_constant + "no config"
+    return True, ""
+
+
+def _guarded(fn: Callable[[], bool], name: str) -> tuple[bool, str]:
+    """Call fn(); return (result, "") on success or (False, "exception during <name>") on error."""
+    try:
+        return fn(), ""
+    except Exception:
+        return False, f"exception during {name}"
 
 
 def contains_remote_code(model: ModelInfo) -> bool:
@@ -184,12 +218,6 @@ def contains_remote_code(model: ModelInfo) -> bool:
     except (ValueError, OSError):
         return True
 
-
-# Session-scoped cache for _has_loadable_weights. Keyed by repo_id; values are
-# the bool result. The fetchers run twice a week in a fresh process, and repo
-# file lists rarely change within a single run, so a plain dict is enough — no
-# TTL or on-disk persistence needed.
-_LOADABLE_WEIGHTS_CACHE: dict[str, bool] = {}
 
 # Filenames transformers' AutoModel.from_pretrained recognizes as native
 # weights (single-file or sharded via the matching index.json).
@@ -203,48 +231,26 @@ _NATIVE_WEIGHT_FILES: frozenset[str] = frozenset(
 )
 
 
-def has_loadable_weights(model: ModelInfo, token: str | bool) -> bool:
+def has_loadable_weights(model: ModelInfo) -> bool:
     """True if the repo ships weights AutoModel.from_pretrained can consume.
 
-    Detects three unloadable classes without downloading any weight files
-    — one ``list_repo_files`` call per repo:
+    Detects three unloadable classes from the sibling metadata included in the
+    bulk ``list_models`` response, without issuing a request per repository:
 
     * adapter-only repos (LoRA/PEFT, `adapter_config.json` but no full model),
     * GGUF/MLX/ONNX-only repos that slipped past the id-substring filter,
     * abandoned uploads with a config but no weight files at all.
-
-    Cached in-process by repo_id: transformers repos are effectively immutable
-    within a fetcher run, and each fetcher process is short-lived.
     """
-    from huggingface_hub import HfApi
-
-    cached = _LOADABLE_WEIGHTS_CACHE.get(model.id)
-    if cached is not None:
-        return cached
-
-    api: HfApi = HfApi(token=token)
-    try:
-        files: list[str] = with_transient_retry(
-            lambda: api.list_repo_files(model.id, token=token),
-            description=f"list_repo_files[{model.id}]",
-        )
-    except Exception:
-        # Any permanent failure (404, gated without token, ...) — treat as
-        # not loadable rather than raising into the fetcher's filter path.
-        _LOADABLE_WEIGHTS_CACHE[model.id] = False
-        return False
-
-    lower_files: set[str] = {f.lower() for f in files}
+    lower_files: set[str] = {
+        sibling.rfilename.lower() for sibling in (model.siblings or [])
+    }
 
     # Adapter-only repos ship adapter_config.json + adapter_model.safetensors
     # and expect PeftModel.from_pretrained(base, ...), not AutoModel directly.
     if "adapter_config.json" in lower_files:
-        _LOADABLE_WEIGHTS_CACHE[model.id] = False
         return False
 
-    result: bool = any(name in lower_files for name in _NATIVE_WEIGHT_FILES)
-    _LOADABLE_WEIGHTS_CACHE[model.id] = result
-    return result
+    return any(name in lower_files for name in _NATIVE_WEIGHT_FILES)
 
 
 def format_number_to_billions_smart(num: int | float) -> str:
@@ -338,7 +344,7 @@ def _resolve_param_columns(
 def build_catalog(
     *,
     fetch_fn: Callable[[int], Iterable[ModelInfo]],
-    filter_fn: Callable[[ModelInfo], bool],
+    filter_fn: Callable[[ModelInfo], tuple[bool, str]],
     limit: int,
     output_csv: Path | str | None,
     label: str,
@@ -352,7 +358,7 @@ def build_catalog(
 
     Args:
         fetch_fn: callable(limit) -> list of raw model objects (over-fetched).
-        filter_fn: callable(model) -> bool, keep the model if True.
+        filter_fn: callable(model) -> (keep, reason), keep the model if keep is True.
         limit: number of rows to write after filtering.
         output_csv: destination path, or None to skip writing.
         label: human-readable noun for log lines (e.g. "generative").
@@ -366,26 +372,49 @@ def build_catalog(
     """
     extra_columns = extra_columns or []
 
-    def _safe_filter(model: ModelInfo) -> bool:
+    def _safe_filter(model: ModelInfo) -> tuple[bool, str]:
         try:
             return filter_fn(model)
-        except Exception as e:
-            logging.warning("filter_fn failed for %s: %s", model.id, e)
-            return False
+        except Exception:
+            return False, "_safe_filter raised an exception"
 
+    timings: dict[str, float] = {}
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
     candidates: list[ModelInfo] = list(fetch_fn(limit))
+    timings["fetch (HF list_models)"] = time.perf_counter() - t0
     print(f"Retrieved {len(candidates)} raw {label} candidates.")
 
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        keep_flags: list[bool] = list(
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        keep_flags: list[tuple[bool, str]] = list(
             tqdm(
                 ex.map(_safe_filter, candidates),
                 total=len(candidates),
                 desc="Filtering candidates",
+                miniters=1000,
+                mininterval=10,
             )
         )
-    models: list[ModelInfo] = [m for m, keep in zip(candidates, keep_flags) if keep]
+    models: list[ModelInfo] = [
+        m for m, (keep, _) in zip(candidates, keep_flags) if keep
+    ]
+    timings["filter (filter_fn)"] = time.perf_counter() - t0
     print(f"Kept {len(models)} {label} models after filtering.")
+
+    reason_counts: dict[str, int] = {}
+    for keep, reason in keep_flags:
+        if not keep:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    if reason_counts:
+        total_filtered_out: int = sum(reason_counts.values())
+        print(f"Filtered out {total_filtered_out} {label} models by reason:")
+        count_width: int = len(f"{limit:,}")
+        for reason, count in sorted(
+            reason_counts.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            print(f"\t{count:>{count_width},} - {reason}")
 
     models = models[:limit]
 
@@ -399,22 +428,25 @@ def build_catalog(
         "parameters (str)",
         "parameters",
         "library",
-        # "is_gated",
-        # "is_moe",
     ]
     extra_head: list[str] = [h for h, _ in extra_columns]
-    tail_head: list[str] = ["is_custom_code", "config_class", "is_supported", "Year"]
+    tail_head: list[str] = ["is_custom_code", "config_class", "Year"]
     header: list[str] = base_head + extra_head + tail_head
 
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=32) as ex:
         config_classes: list[str | None] = list(
             tqdm(
                 ex.map(lambda m: get_config_type(m.id, token), models),
                 total=len(models),
                 desc="Fetching config classes",
+                miniters=1000,
+                mininterval=10,
             )
         )
+    timings["config classes (AutoConfig)"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     rows: list[dict[str, object]] = []
     for rank, (m, config_class) in enumerate(zip(models, config_classes), start=1):
         architectures: list[str] | None = (m.config or {}).get("architectures")
@@ -435,24 +467,25 @@ def build_catalog(
                         param_str,
                         param_int,
                         m.library_name,
-                        # bool(m.gated),
-                        # is_moe(m),
                         *extra_vals,
                         is_custom_code(m),
                         config_class,
-                        is_supported_config(config_class),
                         m.created_at.year if m.created_at else None,
                     ],
                 )
             )
         )
 
+    timings["build rows"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
     if output_csv is not None:
         print(f"Writing top {len(rows)} to {output_csv}")
         with open(output_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=header)
             writer.writeheader()
             writer.writerows(rows)
+    timings["write CSV"] = time.perf_counter() - t0
 
     # Attach the source ModelInfo to each row AFTER the CSV write. It is a
     # runtime-only field (not serializable, and never part of the schema),
@@ -462,8 +495,19 @@ def build_catalog(
     # is_moe is precomputed here (a pure function of data already fetched —
     # tags, config.model_type, config.architectures) so callers that need it
     # don't have to carry the non-serializable ModelInfo object forward.
+    t0 = time.perf_counter()
     for row, m in zip(rows, models):
         row["model_info"] = m
-        row["is_moe"] = is_moe(m)
+        row["is_moe"] = _is_moe(m)
+    timings["attach model_info / is_moe"] = time.perf_counter() - t0
+
+    timings["other"] = (time.perf_counter() - t_total) - sum(timings.values())
+
+    total = sum(timings.values())
+    print(f"\nTiming breakdown for {label} catalog ({total:.1f}s total):")
+    width = max(len(name) for name in timings)
+    for name, secs in timings.items():
+        share = secs / total if total else 0.0
+        print(f"  {name:<{width}}  {secs:7.2f}s  {share:5.1%}")
 
     return rows

@@ -22,15 +22,25 @@ compiled block functions.
 """
 
 import math
+import os
+import sys
 import time
-from typing import Callable, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sympy import factorint
+from transformers import GenerationConfig
+from transformers.generation import GenerateDecoderOnlyOutput
 
-DEVICE = "spyre"
+# Rank-aware device for multi-Spyre (tensor-parallel) runs. torchrun sets
+# LOCAL_RANK before this module is imported, so each process binds to its local
+# AIU. Single-device runs get spyre:0. The conftest CPU-patch overwrites this to
+# "cpu" for CPU tests.
+DEVICE = f"spyre:{os.getenv('LOCAL_RANK', '0')}"
 BLOCK_SIZE = 64  # Spyre stick size at fp16 (128 bytes / 2 bytes per element)
 
 
@@ -38,12 +48,31 @@ class SpyreUnsupportedModelError(ValueError):
     """Architecture is supported, but this config can't run on Spyre."""
 
 
+class SpyreUnsupportedFeatureError(ValueError):
+    """A Hugging Face API feature is not currently supported on Spyre."""
+
+
 class SpyreNoAdapterError(ValueError):
     """No Spyre adapter is registered for this model's architecture."""
 
 
+@contextmanager
+def optional_spyre_config_patch(options: dict[str, Any]) -> Iterator[None]:
+    """Apply a torch-spyre config patch when torch-spyre is available."""
+    try:
+        from torch_spyre._inductor import config as spyre_config
+    except ModuleNotFoundError as error:
+        if error.name != "torch_spyre":
+            raise
+        yield
+        return
+
+    with spyre_config.patch(options):
+        yield
+
+
 def assert_spyre_dimensions(config, model_name):
-    """Reject configs whose ``hidden_size``/``intermediate_size`` is stick-misaligned.
+    """Reject configs whose hidden / intermediate dimensions are stick-misaligned.
 
     The Spyre compiler lays tensors out in ``BLOCK_SIZE``-element sticks.
     Matmuls over a dimension that is not a multiple of ``BLOCK_SIZE`` produce
@@ -53,16 +82,33 @@ def assert_spyre_dimensions(config, model_name):
     and misaligned ones (e.g. ``hidden_size=312``).
 
     ``head_dim`` is not checked — adapters auto-pad it to a stick boundary (see
-    ``prepare_rope_and_heads`` / ``hf_bert.prepare_for_spyre``);
-    ``hidden_size``/``intermediate_size`` can't be padded without changing the
-    model's arithmetic. Real models clear this bar; it fires on tiny test
-    fixtures (e.g. ``trl-internal-testing/tiny-*``, ``cointegrated/rubert-tiny2``).
+    ``prepare_rope_and_heads`` / ``hf_bert.prepare_for_spyre``); hidden and
+    intermediate dims can't be padded without changing the model's arithmetic.
+    Real models clear this bar; it fires on tiny test fixtures (e.g.
+    ``trl-internal-testing/tiny-*``, ``cointegrated/rubert-tiny2``).
+
+    Checks ``hidden_size`` (falling back to DistilBERT's ``dim``) and
+    ``intermediate_size`` (falling back to DistilBERT's ``hidden_dim``).
     """
     dim_config = text_config(config)
     misaligned = [
-        (f, v)
-        for f in ("hidden_size", "intermediate_size")
-        if (v := getattr(dim_config, f, None)) is not None and v % BLOCK_SIZE != 0
+        (label, v)
+        for label, candidates in (
+            ("hidden_size", ("hidden_size", "dim")),
+            ("intermediate_size", ("intermediate_size", "hidden_dim")),
+        )
+        if (
+            v := next(
+                (
+                    getattr(dim_config, f)
+                    for f in candidates
+                    if getattr(dim_config, f, None) is not None
+                ),
+                None,
+            )
+        )
+        is not None
+        and v % BLOCK_SIZE != 0
     ]
     if misaligned:
         details = ", ".join(f"{f}={v}" for f, v in misaligned)
@@ -76,46 +122,44 @@ def assert_spyre_dimensions(config, model_name):
 
 
 def get_backbone(model):
-    """Return the transformer backbone of an HF model.
+    """Return the transformer backbone of an HF model or task wrapper object.
 
-    Auto-loaded models come in two shapes:
-
-    - ``AutoModelForCausalLM`` returns a wrapper (``Qwen3ForCausalLM``,
-      ``LlamaForCausalLM``, ...) whose backbone lives at ``model.model``
-      and which exposes ``model.lm_head``.
-    - ``AutoModel`` returns the bare backbone (``Qwen3Model``,
-      ``LlamaModel``, ...) — no ``.model`` attribute, no ``lm_head``.
-
-    Adapter code reaches into the backbone to access ``embed_tokens``,
-    ``layers``, ``norm``, ``rotary_emb``. This accessor resolves the right
-    object regardless of how the model was loaded.
+    Task-specific auto classes (e.g., ``AutoModelForCausalLM``) return a wrapper
+    containing a backbone and one or more task heads, while the generic AutoModel
+    class may return the backbone directly. Search the supported wrapper attributes
+    and return the first non-``None`` module. If none is present, treat ``model``
+    itself as the backbone.
 
     Multimodal causal-LM wrappers (e.g. Gemma 4's
-    ``Gemma4ForConditionalGeneration``) nest the text decoder one level deeper
-    at ``model.model.language_model``; descend into ``.language_model`` when
-    present so the text backbone is returned.
-
-    GPT-2-family wrappers (``GPT2LMHeadModel``) keep the backbone at
-    ``model.transformer`` rather than ``model.model``; fall back to it when
-    ``.model`` is absent. The bare ``GPT2Model`` (``AutoModel``) has neither, so
-    it is returned as-is — it already is the backbone.
-
-    GPT-NeoX wrappers (``GPTNeoXForCausalLM``) keep the backbone at
-    ``model.gpt_neox`` (with ``embed_in``/``layers``/``final_layer_norm``);
-    fall back to it as well. The bare ``GPTNeoXModel`` is returned as-is.
+    ``Gemma4ForConditionalGeneration``) contain an additional nested
+    ``language_model`` level beneath that first module. Descend into it when
+    present.
     """
-    if hasattr(model, "model"):
-        inner = model.model
-    elif hasattr(model, "transformer"):
-        inner = model.transformer
-    elif hasattr(model, "gpt_neox"):
-        inner = model.gpt_neox
-    elif hasattr(model, "roberta"):
-        # XLMRobertaForSequenceClassification keeps the backbone at .roberta
-        inner = model.roberta
-    else:
-        inner = model
+    inner = next(
+        (
+            backbone
+            for name in (
+                "model",
+                "gpt_neox",
+                "bert",
+                "distilbert",
+                "mpnet",
+                "roberta",
+                "transformer",
+            )
+            if (backbone := getattr(model, name, None)) is not None
+        ),
+        model,
+    )
     return getattr(inner, "language_model", inner)
+
+
+def embed_text_tokens(model, input_ids):
+    """Embed text token ids using the model backbone's embedding policy."""
+    backbone = get_backbone(model)
+    input_ids = input_ids.to(backbone.embed_tokens.weight.device)
+    hidden_states = backbone.embed_tokens(input_ids)
+    return hidden_states * getattr(backbone, "embedding_multiplier", 1.0)
 
 
 def text_config(config):
@@ -130,8 +174,52 @@ def text_config(config):
     return getattr(config, "text_config", None) or config
 
 
+def encode_prompts(
+    tokenizer,
+    prompts,
+    *,
+    padding_side: str = "left",
+    add_generation_prompt: bool = True,
+    chat: bool | None = None,
+):
+    """Tokenize prompt(s) following the model's canonical input scheme.
+
+    Chat/instruct models use their chat template with one user turn and a
+    trailing generation prompt. Base models use the tokenizer directly, which
+    preserves the checkpoint's own special-token post-processor. ``chat`` can
+    force either behavior; by default, the presence of a chat template decides.
+
+    Returns a padded ``BatchEncoding`` containing ``input_ids`` and
+    ``attention_mask``. A single string is normalized to a one-row batch.
+    """
+    prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    use_chat = (tokenizer.chat_template is not None) if chat is None else chat
+    if use_chat:
+        conversations = [[{"role": "user", "content": p}] for p in prompt_list]
+        return tokenizer.apply_chat_template(
+            conversations,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
+            padding_side=padding_side,
+        )
+    return tokenizer(
+        prompt_list,
+        return_tensors="pt",
+        padding=True,
+        padding_side=padding_side,
+        return_attention_mask=True,
+    )
+
+
 # ---------------------------------------------------------------------------
-# RoPE: precompute rotation matrices on CPU (FMS approach)
+# RoPE: precompute rotation matrices on CPU
 # ---------------------------------------------------------------------------
 
 
@@ -321,29 +409,44 @@ def apply_rope_matmul(x, selected_freqs):
 # ---------------------------------------------------------------------------
 
 
-def kv_cache_update(
-    k, v, key_cache, value_cache, is_filling, token_index, cache_position
-):
-    """Update pre-allocated KV cache via native slice assignment at cache_position.
+def kv_cache_update(k, v, key_cache, value_cache, cache_index):
+    """Write K/V into the KV cache by indirect scatter along the cache-position dim.
 
-    All args are tensors; is_filling/token_index/cache_position are Python
-    scalars that torch.compile specializes on.
+    Args:
+        k, v: ``[B, n_kv, n, head_dim]`` — the projections for ``n`` positions.
+        key_cache, value_cache: ``[B, n_kv, max_cache_len, head_dim]``, allocated
+            by ``allocate_kv_caches`` (which pins a device layout placing the
+            cache-position dim at device position 0).
+        cache_index: ``[n]`` int64 index tensor — destination positions along the
+            cache-position dim. Must contain distinct indices: ``index_copy``
+            with duplicates has undefined ordering.
+
+    Writes **in place** and returns the same tensors, ready to hand straight to
+    ``scaled_dot_product_attention`` — the logical shape is unchanged, so no view
+    or permute is needed on the read side.
+
+    In-place is required, not merely cheaper. The out-of-place ``index_copy``
+    allocates a fresh cache per layer per step, and that copy comes back with the
+    **default** device layout rather than the pinned one (measured:
+    ``[576, 8, 2, 1, 64]`` in, ``[8, 576, 2, 1, 64]`` out). Feeding it to the next
+    step's scatter would silently write to the wrong rows (torch-spyre#3705).
+    ``index_copy_`` keeps the pin across sequential writes and still compiles to a
+    single binary.
+
+    ``cache_index`` is a *tensor*, so its value is not a compile-time constant:
+    one compiled binary serves every write position.
+
+    Correctness depends on the pinned device layout: indirect scatter requires the
+    indexed dimension at *device* position 0, and torch-spyre does not currently
+    validate that for a store — a non-compliant cache is written to the wrong
+    rows silently, with no error (torch-spyre#3705). See ``allocate_kv_caches``.
+
+    Every computed position is written: ``cache_index`` has one entry per position
+    in ``k``/``v``. Callers decode one token per step, so ``k``/``v`` carry exactly
+    the positions to store — there is no separate source-gather step.
     """
-    if is_filling:
-        k_write = k[:, :, token_index : token_index + 1, :]
-        v_write = v[:, :, token_index : token_index + 1, :]
-    else:
-        k_write = k
-        v_write = v
-
-    # Native slicing assignment, replacing the deprecated torch.ops.spyre.overwrite
-    # cache_position is a Python int the compiler specializes on, so the slice
-    # bound is a compile-time constant on both CPU and Spyre.
-    # NOTE: on Spyre this still compiles one binary per distinct cache_position
-    seq_len = k_write.shape[2]
-    key_cache[:, :, cache_position : cache_position + seq_len, :] = k_write
-    value_cache[:, :, cache_position : cache_position + seq_len, :] = v_write
-
+    key_cache.index_copy_(2, cache_index, k)
+    value_cache.index_copy_(2, cache_index, v)
     return key_cache, value_cache
 
 
@@ -574,6 +677,42 @@ def pad_attention_heads(
     model._spyre_head_dim = padded_head_dim
 
 
+def pad_attention_heads_linear(
+    model, attentions, orig_head_dim, padded_head_dim, num_heads
+):
+    """Zero-pad standard ``q_proj``/``k_proj``/``v_proj``/``out_proj`` heads.
+
+    This is the non-RoPE MHA layout used by OPT, GPT-Neo, and SigLIP. All four
+    projections use per-head end-padding. The original attention scale remains
+    valid because the added Q/K dimensions are zero.
+    """
+    assert padded_head_dim > orig_head_dim, (
+        f"padded_head_dim ({padded_head_dim}) must exceed "
+        f"orig_head_dim ({orig_head_dim})"
+    )
+    assert (
+        padded_head_dim >= BLOCK_SIZE
+    ), f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
+
+    for attn in attentions:
+        attn.q_proj = _pad_proj_output_simple(
+            attn.q_proj, num_heads, orig_head_dim, padded_head_dim
+        )
+        attn.k_proj = _pad_proj_output_simple(
+            attn.k_proj, num_heads, orig_head_dim, padded_head_dim
+        )
+        attn.v_proj = _pad_proj_output_simple(
+            attn.v_proj, num_heads, orig_head_dim, padded_head_dim
+        )
+        attn.out_proj = _pad_proj_input_simple(
+            attn.out_proj, num_heads, orig_head_dim, padded_head_dim
+        )
+        if hasattr(attn, "head_dim"):
+            attn.head_dim = padded_head_dim
+
+    model._spyre_head_dim = padded_head_dim
+
+
 def pad_attention_heads_simple(
     model, layers, orig_head_dim, padded_head_dim, num_heads
 ):
@@ -632,31 +771,6 @@ def pad_attention_heads_simple(
         attn._spyre_orig_head_dim = orig_head_dim
 
     model._spyre_head_dim = padded_head_dim
-
-
-def patch_rmsnorm(rmsnorm_cls):
-    """Patch any RMSNorm class: variance reduction at input dtype on Spyre, fp32
-    on CPU (to match stock HF).
-
-    Args:
-        rmsnorm_cls: The RMSNorm class to patch (e.g. GraniteRMSNorm, Qwen3RMSNorm).
-    """
-
-    def _forward_fp16(self, hidden_states):
-        if hidden_states.device.type == "spyre":
-            # Spyre path: variance reduction at input dtype (see the note above).
-            variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
-            return self.weight * (
-                hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-            )
-        else:
-            # CPU path: use float32 for numerical stability (matches stock HF)
-            xf = hidden_states.float()
-            variance = (xf * xf).mean(-1, keepdim=True)
-            xf = xf * torch.rsqrt(variance + self.variance_epsilon)
-            return self.weight * xf.to(hidden_states.dtype)
-
-    rmsnorm_cls.forward = _forward_fp16
 
 
 def patch_layernorm(*layernorms):
@@ -866,22 +980,41 @@ def split_fused_linear(w: torch.Tensor) -> tuple[nn.Linear, nn.Linear]:
 # ---------------------------------------------------------------------------
 
 
+def _mask_fill_value(dtype):
+    """Finite fill for masked attention positions (NOT ``-inf``).
+
+    Spyre stores fp16 and bf16 as SEN169_FP16, so use the fp16 range for both.
+    ``finfo(fp16).min / 2`` underflows ``exp()`` to zero and stays in range.
+    """
+    storage_dtype = torch.float16 if dtype in (torch.float16, torch.bfloat16) else dtype
+    return torch.finfo(storage_dtype).min / 2
+
+
 def build_prefill_mask(
     batch_size,
     padded_len,
     max_cache_len,
     prompt_offsets,
     dtype=torch.float16,
+    *,
+    query_start=0,
 ):
-    """Causal mask for prefill, masking left-padding and unused cache positions."""
+    """Causal prefill mask for a query window in the full KV-cache coordinates.
+
+    ``padded_len`` is the number of query rows in this invocation and
+    ``query_start`` is their first cache position.  The latter is zero for a
+    one-shot prefill and advances by the chunk size for chunked prefill.
+    """
+    fill = _mask_fill_value(dtype)
     mask = torch.zeros((batch_size, 1, padded_len, max_cache_len), dtype=dtype)
+    # Left-padding columns are the same regardless of query_start.
     if isinstance(prompt_offsets, torch.Tensor):
         for b in range(batch_size):
-            mask[b, :, :, : prompt_offsets[b].item()] = -torch.inf
+            mask[b, :, :, : prompt_offsets[b].item()] = fill
     else:
-        mask[:, :, :, :prompt_offsets] = -torch.inf
+        mask[:, :, :, :prompt_offsets] = fill
     for i in range(padded_len):
-        mask[:, :, i, i + 1 :] = -torch.inf
+        mask[:, :, i, query_start + i + 1 :] = fill
     return mask
 
 
@@ -894,16 +1027,53 @@ def build_expansion_mask(
     dtype=torch.float16,
 ):
     """Causal mask for an expansion decode step."""
+    fill = _mask_fill_value(dtype)
     mask = torch.zeros((batch_size, 1, block_size, max_cache_len), dtype=dtype)
     if isinstance(prompt_offsets, torch.Tensor):
         for b in range(batch_size):
-            mask[b, :, :, : prompt_offsets[b].item()] = -torch.inf
+            mask[b, :, :, : prompt_offsets[b].item()] = fill
     else:
-        mask[:, :, :, :prompt_offsets] = -torch.inf
+        mask[:, :, :, :prompt_offsets] = fill
     for j in range(block_size):
         attend_up_to = used_cache_len - block_size + j + 1
-        mask[:, :, j, attend_up_to:] = -torch.inf
+        mask[:, :, j, attend_up_to:] = fill
     return mask
+
+
+def build_decode_mask(
+    batch_size,
+    max_cache_len,
+    cache_len,
+    prompt_offsets,
+    dtype=torch.float16,
+):
+    """Mask for a single-token decode step: ``[B, 1, 1, max_cache_len]``.
+
+    The one query row is the token being written at cache column ``cache_len``, so
+    it attends to every real column up to and including its own
+    (``prompt_offsets[b] .. cache_len``) and nothing beyond (the cache tail is
+    unwritten). With a single query row there is only one causal cutoff, so no
+    per-row loop is needed.
+    """
+    fill = _mask_fill_value(dtype)
+    mask = torch.zeros((batch_size, 1, 1, max_cache_len), dtype=dtype)
+    if isinstance(prompt_offsets, torch.Tensor):
+        for b in range(batch_size):
+            mask[b, :, :, : prompt_offsets[b].item()] = fill
+    else:
+        mask[:, :, :, :prompt_offsets] = fill
+    mask[:, :, :, cache_len + 1 :] = fill
+    return mask
+
+
+def _materialize_decode_mask_heads(mask, num_heads):
+    """Expand ``[B,1,1,Lk]`` decode mask to ``[B,H,1,Lk]`` (contiguous)."""
+    if mask.ndim != 4 or mask.shape[1] != 1 or mask.shape[2] != 1:
+        raise ValueError(
+            "decode mask head materialization requires [B,1,1,Lk], got "
+            f"{tuple(mask.shape)}"
+        )
+    return mask.expand(mask.shape[0], num_heads, 1, mask.shape[3]).contiguous()
 
 
 def build_prefill_mask_right_padded(
@@ -945,7 +1115,7 @@ def build_prefill_mask_right_padded(
     return mask
 
 
-def add_sliding_window_band(mask, sliding_window, dtype=torch.float16):
+def add_sliding_window_band(mask, sliding_window):
     """Restrict an additive bidirectional mask to a local ``±sliding_window`` band.
 
     ModernBERT alternates global (full) attention layers with local
@@ -965,7 +1135,7 @@ def add_sliding_window_band(mask, sliding_window, dtype=torch.float16):
     padded_len = mask.shape[-1]
     idx = torch.arange(padded_len)
     off_band = (idx[:, None] - idx[None, :]).abs() > sliding_window  # [L, L]
-    band = torch.zeros((padded_len, padded_len), dtype=dtype)
+    band = torch.zeros((padded_len, padded_len), dtype=mask.dtype)
     band[off_band] = -torch.inf
     return mask + band[None, None, :, :]
 
@@ -1032,19 +1202,51 @@ def add_causal_sliding_window_band(mask, query_cache_coords, sliding_window):
 # ---------------------------------------------------------------------------
 
 
+def _projection_head_count(proj, config_count, head_dim):
+    """Derive head count from a projection module, falling back to config.
+
+    Under tensor parallelism, ``out_features`` reflects the local output
+    contract; ``weight.shape[0]`` is the fallback for custom modules.
+    """
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
+    if proj is None:
+        count = int(config_count)
+        if count <= 0:
+            raise ValueError(f"head count must be positive, got {count}")
+        return count
+    projection_width = getattr(proj, "out_features", None)
+    if projection_width is None:
+        weight = getattr(proj, "weight", None)
+        if weight is None:
+            count = int(config_count)
+            if count <= 0:
+                raise ValueError(f"head count must be positive, got {count}")
+            return count
+        projection_width = weight.shape[0]
+    projection_width = int(projection_width)
+    if projection_width <= 0 or projection_width % head_dim != 0:
+        raise ValueError(
+            f"projection width must be a positive multiple of head_dim, "
+            f"got width={projection_width}, head_dim={head_dim}"
+        )
+    return projection_width // head_dim
+
+
+def _local_query_head_count(model, head_dim):
+    """Return the local query-head count (accounts for tensor parallelism)."""
+    cfg = text_config(model.config)
+    layers = getattr(get_backbone(model), "layers", None)
+    self_attn = getattr(layers[0], "self_attn", None) if layers else None
+    q_proj = getattr(self_attn, "q_proj", None)
+    return _projection_head_count(q_proj, cfg.num_attention_heads, head_dim)
+
+
 def kv_cache_shapes(model):
-    """Resolve the per-layer ``(num_kv_heads, head_dim, v_head_dim)`` KV shapes.
+    """Resolve per-layer ``(num_kv_heads, head_dim, v_head_dim)`` KV shapes.
 
-    Most models use one uniform shape across all layers, derived from
-    ``num_key_value_heads`` and ``head_dim`` (with optional ``_spyre_head_dim`` /
-    ``_spyre_v_head_dim`` overrides from head padding). Models whose layers
-    differ — e.g. Gemma 4, where global ("full_attention") layers use a larger
-    ``global_head_dim`` and a different KV-head count than the sliding layers —
-    set ``model._spyre_kv_shapes`` to an explicit per-layer list. When present,
-    that list wins and this returns it verbatim.
-
-    Returns a list of length ``num_hidden_layers`` of
-    ``(num_kv_heads, head_dim, v_head_dim)`` tuples.
+    Returns the explicit ``_spyre_kv_shapes`` when set (e.g. Gemma 4), otherwise
+    derives a uniform shape from the first layer's projection or config.
     """
     explicit = getattr(model, "_spyre_kv_shapes", None)
     if explicit is not None:
@@ -1052,33 +1254,177 @@ def kv_cache_shapes(model):
 
     cfg = text_config(model.config)
     num_layers = cfg.num_hidden_layers
-    num_kv_heads = cfg.num_key_value_heads
     head_dim = (
         getattr(model, "_spyre_head_dim", None)
         or getattr(cfg, "head_dim", None)
         or cfg.hidden_size // cfg.num_attention_heads
     )
+    layers = getattr(get_backbone(model), "layers", None)
+    self_attn = getattr(layers[0], "self_attn", None) if layers else None
+    k_proj = getattr(self_attn, "k_proj", None)
+    num_kv_heads = _projection_head_count(k_proj, cfg.num_key_value_heads, head_dim)
     v_head_dim = getattr(model, "_spyre_v_head_dim", head_dim)
     return [(num_kv_heads, head_dim, v_head_dim) for _ in range(num_layers)]
 
 
+# Mirrors torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE.
+_SDPA_MAX_SEQUENCE_TILE_SIZE = 512
+
+
+def _sdpa_compatible_kv_length(min_length: int) -> int:
+    """Round *min_length* up to a multiple of the SDPA KV block size (512)."""
+    return (
+        math.ceil(min_length / _SDPA_MAX_SEQUENCE_TILE_SIZE)
+        * _SDPA_MAX_SEQUENCE_TILE_SIZE
+    )
+
+
+def generation_cache_len(prompt_length: int, max_new_tokens: int) -> int:
+    """Compute a compiler-compatible KV cache size for prompt plus generation.
+
+    Callers must pass the padded prefill extent, not the raw prompt length, so
+    the first decode position is inside the cache. The base requirement pads
+    prompt and generation capacity independently to one stick. The standard
+    SDPA lowering stages fixed-size KV blocks, whose extent must divide the
+    backing cache tensor. Add the minimum whole-stick padding that satisfies
+    that constraint; short generations normally need no extra space, while an
+    exact 8K/32K prompt gains one 512-token block.
+    """
+    padded_prompt = math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
+    padded_generation = math.ceil(max_new_tokens / BLOCK_SIZE) * BLOCK_SIZE
+    return _sdpa_compatible_kv_length(padded_prompt + padded_generation)
+
+
+def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
+    """Select cache tensors passed to prefill without wrapping one-shot caches."""
+    if not chunked_prefill:
+        return caches
+    return [
+        cache[:, :, :prefill_kv_len, :] if cache.ndim == 4 else cache
+        for cache in caches
+    ]
+
+
+def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
+    """Device layout for a ``[B, n_kv, L, hd]`` cache with ``L`` OUTERMOST on device.
+
+    Indirect access (gather/scatter) requires the indexed dimension — here the
+    cache-position dim ``L`` — to sit at *device* position 0. The
+    ``SpyreTensorLayout`` decouples the device layout from the logical shape, so
+    the cache keeps its natural ``[B, n_kv, L, hd]`` shape (``index_copy`` on dim
+    2, SDPA reads it directly) while the device sees ``L`` first.
+
+    Device order is ``[L, n_kv, sticks, B, eps]``: the batch sits between the
+    stick-count dim and the elems-per-stick dim. ``stride_map`` gives each device
+    dim its stride in the logical row-major tensor.
+
+    Note the logical dim order does NOT control the device order — logically
+    permuting the cache moves the indexed dim *further* from device position 0
+    (measured: 1 -> 2 -> 3). It has to be stated explicitly here.
+
+    Returns ``None`` when torch-spyre is unavailable (CPU runs), so callers fall
+    back to a plain allocation.
+    """
+    try:
+        # Prime torch-spyre autoload before importing torch_spyre._C: calls with
+        # the spyre-only device_layout kwarg fail kwarg validation before
+        # dispatch, and the STL constructor needs a live RuntimeContext.
+        torch.empty(1, device=DEVICE)
+        from torch_spyre._C import (  # type: ignore[import-not-found]
+            SpyreTensorLayout,
+            get_device_dtype,
+        )
+    except Exception:  # noqa: BLE001 - torch-spyre absent or device unavailable
+        return None
+
+    shape = [batch_size, num_kv_heads, max_cache_len, head_dim]
+    eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
+    sticks = (head_dim + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[max_cache_len, num_kv_heads, sticks, batch_size, eps],
+        stride_map=[
+            head_dim,  # L
+            max_cache_len * head_dim,  # n_kv
+            eps,  # stick count
+            num_kv_heads * max_cache_len * head_dim,  # B
+            1,  # elems per stick
+        ],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
+def make_cache_index(start, length, device=None):
+    """Destination cache slots ``[start, start + length)`` as an index tensor.
+
+    The ``cache_index`` argument of ``kv_cache_update``. The decode loop uses
+    two shapes:
+
+      * prefill     — ``make_cache_index(0, padded_len)`` (whole padded block)
+      * decode step — ``make_cache_index(current_cache_len, 1)`` (one token)
+
+    Built on CPU then moved, since ``torch.arange`` falls back to CPU on Spyre
+    anyway. Indices are distinct by construction (``index_copy`` with duplicate
+    indices has undefined ordering).
+    """
+    idx = torch.arange(start, start + length, dtype=torch.long)
+    return idx.to(device) if device is not None else idx
+
+
+def allocate_kv_cache_tensor(
+    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, device=None
+):
+    """Allocate one zeroed KV tensor with a scatter-ready device layout."""
+    if device is None:
+        device = DEVICE
+    on_spyre = torch.device(device).type == "spyre"
+    stl = (
+        _cache_position_first_stl(
+            batch_size, num_kv_heads, max_cache_len, head_dim, dtype
+        )
+        if on_spyre
+        else None
+    )
+    shape = (batch_size, num_kv_heads, max_cache_len, head_dim)
+    if stl is None:
+        return torch.zeros(shape, dtype=dtype, device=device)
+    cache: torch.Tensor = torch.empty(  # type: ignore[call-overload]
+        shape,
+        device=torch.device(device),
+        device_layout=stl,
+        dtype=dtype,
+    )
+    cache.zero_()
+    return cache
+
+
 def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
-    """Allocate zeroed per-layer key/value caches matching the model's shapes.
+    """Allocate zeroed per-layer key/value caches with a scatter-ready device layout.
+
+    Shapes are unchanged: ``[batch_size, n_kv_heads, max_cache_len, head_dim]``.
+    On Spyre the *device* layout is pinned so the cache-position dim lands at
+    device position 0, which is what ``kv_cache_update``'s indirect scatter
+    requires. The logical shape is untouched, so ``index_copy`` writes dim 2 and
+    ``scaled_dot_product_attention`` reads the cache directly — no views, and
+    measured relayout-free even when the scatter and attention fuse into one
+    graph.
 
     Honors ``model._spyre_kv_shapes`` (see ``kv_cache_shapes``) so models with
-    heterogeneous layer shapes get correctly-sized caches per layer. Returns
-    ``(key_caches, value_caches)`` lists. ``device`` defaults to the module
-    ``DEVICE`` resolved at call time (so the conftest CPU patch applies).
+    heterogeneous layer shapes (e.g. Gemma 4's global vs sliding layers) get
+    correctly-sized caches per layer. Returns ``(key_caches, value_caches)``
+    lists. ``device`` defaults to the module ``DEVICE`` resolved at call time (so
+    the conftest CPU patch applies).
     """
     if device is None:
         device = DEVICE
+    if allocator := getattr(model, "_spyre_cache_allocator", None):
+        return allocator(model, batch_size, max_cache_len, dtype, device)
     shapes = kv_cache_shapes(model)
     key_caches = [
-        torch.zeros(batch_size, n_kv, max_cache_len, hd, dtype=dtype, device=device)
+        allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, hd, dtype, device)
         for (n_kv, hd, _vhd) in shapes
     ]
     value_caches = [
-        torch.zeros(batch_size, n_kv, max_cache_len, vhd, dtype=dtype, device=device)
+        allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, vhd, dtype, device)
         for (n_kv, _hd, vhd) in shapes
     ]
     return key_caches, value_caches
@@ -1089,62 +1435,32 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
 # ---------------------------------------------------------------------------
 
 
-def _patch_torch_empty():
-    """Workaround for torch_spyre spyre_empty() not accepting size= kwarg.
-
-    Upstream fix: https://github.com/torch-spyre/torch-spyre/issues/1729
-    """
-    _orig = torch.empty
-
-    def _patched(*args, size=None, **kwargs):
-        if size is not None:
-            return _orig(size, **kwargs)
-        return _orig(*args, **kwargs)
-
-    if getattr(torch.empty, "_hf_adapters_patched", False):
-        return
-    torch.empty = _patched
-    torch.empty._hf_adapters_patched = True
-
-
-def _embedding_param_ids(model):
-    """Data-pointers of weights that must keep the default (column-major) layout.
-
-    Gather-only embedding weights (used via ``nn.Embedding``, not matmul) must not
-    receive a row-major SpyreTensorLayout. Returns the set of ``data_ptr()``
-    values for all such weights.
-
-    Found by walking ``named_modules`` for ``nn.Embedding`` rather than matching
-    known attribute names. The name-matching version missed ModernBERT's
-    ``embeddings.tok_embeddings`` (and would miss the next new spelling), which
-    silently sent a [180000, 384] table down the matmul-weight path.
-    """
-    return {
-        module.weight.data_ptr()
-        for module in model.modules()
-        if isinstance(module, nn.Embedding)
-        and module.weight is not None
-        and module.weight.dim() == 2
-    }
-
-
 def untie_embedding_and_lm_head(model):
     """If the token-embedding weight and the LM head weight share storage, clone
-    the LM head's weight so each can take a different Spyre layout.
+    the LM head's weight so each can take a different device and Spyre layout.
     """
     head = _get_lm_head(model)
+    if head is None and hasattr(model, "get_output_embeddings"):
+        head = model.get_output_embeddings()
     if head is None:
         return
-    backbone = get_backbone(model)
-    embed = (
-        getattr(backbone, "embed_tokens", None)
-        or getattr(backbone, "wte", None)
-        or getattr(backbone, "embed_in", None)
-    )
+    if hasattr(model, "get_input_embeddings"):
+        embed = model.get_input_embeddings()
+    else:
+        backbone = get_backbone(model)
+        embed = (
+            getattr(backbone, "embed_tokens", None)
+            or getattr(backbone, "wte", None)
+            or getattr(backbone, "embed_in", None)
+        )
     if embed is None:
         return
     if embed.weight.data_ptr() == head.weight.data_ptr():
-        head.weight = nn.Parameter(head.weight.detach().clone(), requires_grad=False)
+        # Under TP the weights are already on Spyre after ``from_pretrained``;
+        # leave the clone on CPU and let ``_move_to_spyre_with_layout``
+        # place it, as on the single-device path.
+        cloned = head.weight.detach().to("cpu").clone()
+        head.weight = nn.Parameter(cloned, requires_grad=False)
         if hasattr(model, "config"):
             model.config.tie_word_embeddings = False
 
@@ -1162,13 +1478,15 @@ def get_model_dtype(model: nn.Module) -> torch.dtype:
 
 
 def _move_to_spyre_with_layout(model, dtype):
-    """Move all parameters and buffers to Spyre with row-major layout for 2D
-    matmul weights, except embedding weights which keep the default layout.
+    """Prepare RoPE then transfer the model to Spyre via torch-spyre.
+
+    Layout selection (``dim_order=[1,0]`` for ``nn.Linear`` weights) is owned by
+    ``torch_spyre.model_utils.load_model_to_spyre``. This wrapper only handles
+    HF-specific RoPE prep before the device move.
     """
     # Propagate dtype to the precomputed RoPE module(s) so the freq cache
     # matches the chosen weight dtype (avoids fp16/bf16 mismatch in
-    # apply_rope_matmul when dtype != fp16). Done before the CPU early-return so
-    # both the CPU and Spyre paths get it.
+    # apply_rope_matmul when dtype != fp16).
     set_rope_dtype(model, dtype)
 
     # Build the RoPE rotation cache on CPU now, before any device move. If left
@@ -1176,54 +1494,72 @@ def _move_to_spyre_with_layout(model, dtype):
     # graph and corrupt the result (see prebuild_rope_cache). Harmless on CPU.
     prebuild_rope_cache(model)
 
-    if torch.device(DEVICE).type != "spyre":
-        model.to(dtype=dtype)
-        return
+    model.to(dtype=dtype, device=DEVICE)
 
-    # Prime torch-spyre autoload before importing torch_spyre._C or calling
-    # torch.empty(..., device_layout=...). Calls with the spyre-only
-    # device_layout kwarg fail kwarg validation before dispatch.
-    torch.empty(1, device=DEVICE)
 
-    from torch_spyre._C import SpyreTensorLayout  # type: ignore[import-not-found]
+def _resolve_tp_plan(model_path, auto_model_cls, tp_plan):
+    """Resolve a caller's ``tp_plan`` into a dict HF can shard on Spyre.
 
-    skip_layout_ptrs = _embedding_param_ids(model)
+    ``tp_plan="auto"`` expands (via the model's ``base_model_tp_plan`` +
+    class ``_tp_plan``) to a plan that shards attention/MLP **and** the
+    ``lm_head`` with ``colwise_gather_output``. On Spyre we keep the ``lm_head``
+    replicated instead:
 
-    def _alloc_on_spyre(t: torch.Tensor) -> torch.Tensor:
-        # The row-major [1, 0] dim_order describes a 2-D permutation, so it only
-        # applies to 2-D matmul weights. 1-D tensors (norms, biases) and any
-        # higher-rank weight (e.g. the 3-D/4-D Conv2d and position-embedding
-        # tables in a multimodal checkpoint's vision/audio towers) keep the
-        # default layout — forcing [1, 0] on them raises "Incompatible host_size
-        # and dim_order". Embedding tables are gather-only and also skipped.
-        if t.dim() == 2 and t.data_ptr() not in skip_layout_ptrs:
-            stl = SpyreTensorLayout(t.shape, t.stride(), dtype, [1, 0])
-        else:
-            stl = None
-        new: torch.Tensor = torch.empty(  # type: ignore[call-overload]
-            t.shape,
-            device=torch.device(DEVICE),
-            device_layout=stl,
-            dtype=dtype,
+    - HF's ``validate_module`` rejects ``colwise_gather_output`` when
+      ``vocab_size`` isn't divisible by the rank count (e.g. granite-3.3-8b's
+      49159), which would fail at load before the model ever runs.
+    - Our ``pad_lm_head`` pads the vocab to a Spyre stick boundary *after* load,
+      so sharding the head upstream fights that layout pass.
+
+    Dropping ``lm_head`` from the plan leaves it unmatched, which HF treats as
+    replicated (full head on every rank).
+    Similarly, we also drop ``model.embed_tokens``, which is automatically added
+    for models with tied embeddings, and currently involves unsupported bool
+    comparisons of int32 tensors.
+
+    We resolve the fully-namespaced plan
+    by instantiating the model on the ``meta`` device (no weights allocated) and
+    reading its ``.tp_plan`` — this uses HF's own namespacing rather than
+    reconstructing it, so it stays correct across model families.
+
+    A dict ``tp_plan`` is returned unchanged (the caller is explicit).
+    """
+    if tp_plan != "auto":
+        return tp_plan
+
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_path)
+    with torch.device("meta"):
+        probe = auto_model_cls.from_config(cfg)
+    plan = dict(probe.tp_plan or {})
+    plan.pop("lm_head", None)
+    plan.pop("model.embed_tokens", None)
+    return plan
+
+
+def _resolve_tp_size():
+    """Resolve and validate the TP degree required by ``DistributedConfig``."""
+    world_size = os.getenv("WORLD_SIZE")
+    if world_size is None:
+        raise ValueError(
+            "tp_size is required when WORLD_SIZE is not set; launch with "
+            "torchrun or pass tp_size explicitly"
         )
-        new.copy_(t.to(dtype))
-        return new
-
-    for name, param in list(model.named_parameters()):
-        new = _alloc_on_spyre(param.data)
-        module_path, _, attr = name.rpartition(".")
-        owner = model.get_submodule(module_path) if module_path else model
-        setattr(owner, attr, nn.Parameter(new, requires_grad=False))
-
-    for name, buf in list(model.named_buffers()):
-        new = _alloc_on_spyre(buf)
-        module_path, _, attr = name.rpartition(".")
-        owner = model.get_submodule(module_path) if module_path else model
-        persistent = attr not in owner._non_persistent_buffers_set
-        owner.register_buffer(attr, new, persistent=persistent)
+    try:
+        tp_size = int(world_size)
+    except ValueError as exc:
+        raise ValueError(f"WORLD_SIZE must be an integer, got {world_size!r}") from exc
+    return tp_size
 
 
-def load_model_common(model_path, module, dtype=torch.float16, auto_model_cls=None):
+def load_model_common(
+    model_path,
+    module,
+    dtype=torch.float16,
+    auto_model_cls=None,
+    tp_plan=None,
+):
     """Load an HF model.
 
     Args:
@@ -1232,14 +1568,36 @@ def load_model_common(model_path, module, dtype=torch.float16, auto_model_cls=No
         dtype: Weight dtype (default fp16).
         auto_model_cls: HF auto-model class to use (e.g. ``AutoModel``,
             ``AutoModelForCausalLM``). Defaults to ``AutoModel``.
+        tp_plan: Optional tensor-parallel plan (e.g. ``"auto"``). When set, HF
+            shards the model across the ``torchrun`` process group and
+            ``device_map`` is omitted so HF's TP placement is authoritative.
+            ``"auto"`` is resolved to a plan that keeps ``lm_head`` replicated
+            (see ``_resolve_tp_plan``).
     """
     if auto_model_cls is None:
         from transformers import AutoModel
 
         auto_model_cls = AutoModel
 
+    if tp_plan is not None and hasattr(module, "load_hf_model"):
+        raise SpyreUnsupportedModelError(
+            "tensor-parallel loading is not supported by this adapter's custom loader"
+        )
+
     if hasattr(module, "load_hf_model"):
         model = module.load_hf_model(model_path, dtype)
+    elif tp_plan is not None:
+        from transformers.distributed import DistributedConfig
+
+        distributed_config = DistributedConfig(
+            tp_size=_resolve_tp_size(),
+            tp_plan=_resolve_tp_plan(model_path, auto_model_cls, tp_plan),
+        )
+        model = auto_model_cls.from_pretrained(
+            model_path,
+            dtype=dtype,
+            distributed_config=distributed_config,
+        )
     else:
         model = auto_model_cls.from_pretrained(
             model_path,
@@ -1255,8 +1613,6 @@ def load_model_common(model_path, module, dtype=torch.float16, auto_model_cls=No
 def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
     untie_embedding_and_lm_head(model)
     module.prepare_for_spyre(model)
-    # print("Moving model to Spyre ...")
-    _patch_torch_empty()
     _move_to_spyre_with_layout(model, dtype)
     for submod_name in getattr(model, "_spyre_cpu_submodules", []):
         model.get_submodule(submod_name).to("cpu")
@@ -1293,39 +1649,80 @@ def _normalize_eos_ids(eos):
     return eos
 
 
-def _resolve_generation_params(model, tokenizer, overrides):
-    """Resolve sampling + stop params via HF's ``_prepare_generation_config``.
+_SUPPORTED_GENERATION_OPTIONS = {
+    "max_length",
+    "max_new_tokens",
+    "min_new_tokens",
+    "do_sample",
+    "temperature",
+    "top_k",
+    "top_p",
+    "suppress_tokens",
+    "begin_suppress_tokens",
+    "forced_bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "return_dict_in_generate",
+    "output_scores",
+    "output_logits",
+    "prefill_chunk_size",
+    # Decoder-only callers provide the prompt, so these IDs are inert metadata.
+    "bos_token_id",
+    "decoder_start_token_id",
+}
+_GENERATION_CONFIG_METADATA = {"_from_model_config", "transformers_version"}
+_NEUTRAL_GENERATION_CONFIG = GenerationConfig().to_dict()
+_NEUTRAL_GENERATION_CONFIG.update(GenerationConfig._get_default_generation_params())
+_NEUTRAL_GENERATION_CONFIG.update(
+    output_attentions=False,
+    output_hidden_states=False,
+)
 
-    Precedence matches stock HF: ``explicit kwarg > model.generation_config >
-    HF global defaults``. Parameters with ``None`` are dropped so HF
-    fills them. EOS is normalized to a tensor.
 
-    Returns a dict with keys ``do_sample, temperature, top_k, top_p`` plus
-    ``eos_ids`` (a long tensor or ``None``).
-    """
-    eos_specified = "eos_token_id" in overrides
+def _validate_supported_generation_config(cfg):
+    """Reject active generation options outside the Spyre loop's allowlist."""
+    active = []
+    for name, value in cfg.to_dict().items():
+        if name in _SUPPORTED_GENERATION_OPTIONS or name in _GENERATION_CONFIG_METADATA:
+            continue
+        neutral = _NEUTRAL_GENERATION_CONFIG.get(name)
+        if value is not None and value != neutral:
+            active.append(name)
+    if active:
+        options = ", ".join(f"`{name}`" for name in sorted(active))
+        raise SpyreUnsupportedFeatureError(
+            f"The following generation options are not supported on Spyre: {options}"
+        )
+
+
+def _resolve_generation_params(model, generation_config, overrides, model_kwargs):
+    """Resolve supported parameters via the stock HF generation-config merge."""
     explicit = {
         k: v for k, v in overrides.items() if k == "eos_token_id" or v is not None
     }
-    cfg, _ = model._prepare_generation_config(None, **explicit)
+    explicit.update(model_kwargs)
+    cfg, unused = model._prepare_generation_config(generation_config, **explicit)
+    if unused:
+        names = sorted(unused)
+        raise ValueError(
+            f"The following `model_kwargs` are not used by the model: {names} "
+            "(note: typos in the generate arguments will also show up in this list)"
+        )
+    _validate_supported_generation_config(cfg)
 
-    eos = cfg.eos_token_id
-    # Fall back to the tokenizer only when EOS was unspecified — an explicit
-    # eos_token_id=None means "disable EOS" and must not be re-enabled.
-    if eos is None and not eos_specified:
-        eos = getattr(tokenizer, "eos_token_id", None)
+    eos_ids = _normalize_eos_ids(cfg.eos_token_id)
+    if eos_ids is not None:
+        eos_ids = eos_ids.to(device="cpu", dtype=torch.long).reshape(-1)
 
-    return {
-        "do_sample": cfg.do_sample,
-        "temperature": cfg.temperature,
-        "top_k": cfg.top_k,
-        "top_p": cfg.top_p,
-        "eos_ids": _normalize_eos_ids(eos),
-    }
+    pad_token_id = cfg.pad_token_id
+    if pad_token_id is None and eos_ids is not None:
+        pad_token_id = eos_ids[0].item()
+
+    return cfg, eos_ids, pad_token_id
 
 
-def pad_and_position(input_ids, actual_lengths):
-    """Left block-pad ``input_ids`` to a BLOCK_SIZE multiple and build positions.
+def pad_and_position(input_ids, actual_lengths, pad_to_multiple=BLOCK_SIZE):
+    """Left-pad ``input_ids`` to ``pad_to_multiple`` and build positions.
 
     Returns ``(padded_ids, padded_len, prompt_offsets, position_ids)``. Real
     tokens are right-aligned: each row's positions ``0..actual_len-1`` sit at
@@ -1333,7 +1730,17 @@ def pad_and_position(input_ids, actual_lengths):
     convention). Shared by ``generate`` and the VLM adapters' prefill arms.
     """
     batch_size, prompt_length = input_ids.shape
-    padded_len = math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
+    if (
+        isinstance(pad_to_multiple, bool)
+        or not isinstance(pad_to_multiple, int)
+        or pad_to_multiple <= 0
+        or pad_to_multiple % BLOCK_SIZE != 0
+    ):
+        raise ValueError(
+            f"pad_to_multiple must be a positive multiple of {BLOCK_SIZE}, "
+            f"got {pad_to_multiple!r}"
+        )
+    padded_len = math.ceil(prompt_length / pad_to_multiple) * pad_to_multiple
     block_pad = padded_len - prompt_length
     if block_pad > 0:
         pad = input_ids.new_zeros((batch_size, block_pad))
@@ -1347,79 +1754,220 @@ def pad_and_position(input_ids, actual_lengths):
     return input_ids, padded_len, prompt_offsets, position_ids
 
 
-def select_next_token(next_logits, do_sample, temperature, top_k, top_p):
-    """CPU token selection: greedy argmax, or temperature/top-k/top-p sampling.
+@dataclass
+class NormalizedGenerationInputs:
+    """Block-normalized prompt geometry shared by text and multimodal generation."""
 
-    The top-p path mirrors HF's ``TopPLogitsWarper.__call__``.
+    original_input_ids: torch.Tensor
+    input_ids: torch.Tensor
+    actual_lengths: torch.Tensor
+    padded_len: int
+    prompt_offsets: torch.Tensor
+    position_ids: torch.Tensor
+    valid_spans: tuple[tuple[int, int], ...]
+    compact_len: int
+    original_shape: tuple[int, int]
+
+    def normalize_token_aligned(self, value, *, pad_value=0):
+        """Apply the prompt's span compaction and block padding to side data."""
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                "token-aligned generation inputs must be torch.Tensor values"
+            )
+        if value.ndim < 2 or tuple(value.shape[:2]) != self.original_shape:
+            raise ValueError(
+                "token-aligned generation inputs must match input_ids in their first two dimensions"
+            )
+
+        value_cpu = value.detach().to("cpu")
+        compact_shape = (self.original_shape[0], self.compact_len, *value.shape[2:])
+        compact = value_cpu.new_full(compact_shape, pad_value)
+        for b, (first, last) in enumerate(self.valid_spans):
+            row = value_cpu[b, first:last]
+            compact[b, self.compact_len - row.shape[0] :] = row
+
+        block_pad = self.padded_len - self.compact_len
+        if block_pad == 0:
+            return compact
+        pad_shape = (self.original_shape[0], block_pad, *value.shape[2:])
+        pad = value_cpu.new_full(pad_shape, pad_value)
+        return torch.cat([pad, compact], dim=1)
+
+
+def normalize_generation_inputs(
+    input_ids, attention_mask=None, pad_to_multiple=BLOCK_SIZE
+):
+    """Validate and normalize tokenized decoder inputs for block generation."""
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("input_ids must be a torch.Tensor")
+    if input_ids.ndim != 2:
+        raise ValueError("input_ids must have shape [batch_size, sequence_length]")
+    if input_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("input_ids must have integer dtype torch.int32 or torch.int64")
+
+    batch_size, sequence_length = input_ids.shape
+    if batch_size == 0:
+        raise ValueError("input_ids must contain at least one sequence")
+    if sequence_length == 0:
+        raise ValueError("input_ids sequences must contain at least one token")
+
+    input_ids_cpu = input_ids.detach().to("cpu")
+    if attention_mask is None:
+        mask = torch.ones_like(input_ids_cpu, dtype=torch.bool)
+    else:
+        if not isinstance(attention_mask, torch.Tensor):
+            raise TypeError("attention_mask must be a torch.Tensor")
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must have the same shape as input_ids")
+        attention_mask_cpu = attention_mask.detach().to("cpu")
+        if not (
+            attention_mask_cpu.dtype.is_floating_point
+            or attention_mask_cpu.dtype == torch.bool
+            or attention_mask_cpu.dtype
+            in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+        ):
+            raise TypeError("attention_mask must have a boolean or numeric dtype")
+        is_binary = torch.all((attention_mask_cpu == 0) | (attention_mask_cpu == 1))
+        if not is_binary.item():
+            raise ValueError("attention_mask values must be 0 or 1")
+        mask = attention_mask_cpu.to(dtype=torch.bool)
+
+    actual_lengths = mask.sum(dim=1, dtype=torch.long)
+    if torch.any(actual_lengths == 0):
+        raise ValueError("each input sequence must contain at least one unmasked token")
+
+    valid_spans = []
+    valid_rows = []
+    for b in range(batch_size):
+        valid_indices = mask[b].nonzero(as_tuple=True)[0]
+        first = valid_indices[0].item()
+        last = valid_indices[-1].item() + 1
+        if last - first != actual_lengths[b].item():
+            raise ValueError(
+                "attention_mask must contain one contiguous span of unmasked tokens per row"
+            )
+        valid_spans.append((first, last))
+        valid_rows.append(input_ids_cpu[b, first:last])
+
+    compact_len = actual_lengths.max().item()
+    compact_ids = input_ids_cpu.new_zeros((batch_size, compact_len))
+    for b, valid_ids in enumerate(valid_rows):
+        compact_ids[b, compact_len - valid_ids.numel() :] = valid_ids
+
+    padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
+        compact_ids, actual_lengths, pad_to_multiple
+    )
+    return NormalizedGenerationInputs(
+        original_input_ids=input_ids_cpu,
+        input_ids=padded_ids,
+        actual_lengths=actual_lengths,
+        padded_len=padded_len,
+        prompt_offsets=prompt_offsets,
+        position_ids=position_ids,
+        valid_spans=tuple(valid_spans),
+        compact_len=compact_len,
+        original_shape=(batch_size, sequence_length),
+    )
+
+
+def generation_begin_index(input_ids_seq_length, forced_bos_token_id):
+    """Return stock HF's sequence length for begin-token suppression."""
+    begin_index = input_ids_seq_length
+    if input_ids_seq_length == 1 and forced_bos_token_id is not None:
+        begin_index += 1
+    return begin_index
+
+
+def select_next_token(
+    next_logits,
+    do_sample,
+    temperature,
+    top_k,
+    top_p,
+    suppress_tokens=None,
+    begin_suppress_tokens=None,
+    forced_bos_token_id=None,
+    current_length=None,
+    begin_suppress_index=None,
+    return_scores=False,
+):
+    """CPU token selection with supported HF processing and optional scores.
+
+    Returned scores are the fully processed values used for selection: forced
+    BOS and token suppression for greedy generation, plus temperature/top-k/top-p
+    warping for sampling. ``return_scores=False`` preserves the token-only API
+    used by the multimodal generation paths.
     """
+    force_bos = forced_bos_token_id is not None and current_length == 1
+    suppress_at_begin = begin_suppress_tokens and current_length == begin_suppress_index
+    scores = next_logits
+    if force_bos:
+        scores = torch.full_like(scores, -torch.inf)
+        scores[:, forced_bos_token_id] = 0
+    elif suppress_tokens or suppress_at_begin:
+        scores = scores.clone()
+    if suppress_tokens:
+        scores[:, suppress_tokens] = -torch.inf
+    if suppress_at_begin:
+        scores[:, begin_suppress_tokens] = -torch.inf
     if not do_sample:
-        return torch.argmax(next_logits, dim=-1)  # [B]
-    scaled = next_logits / temperature
+        tokens = torch.argmax(scores, dim=-1)  # [B]
+        return (tokens, scores) if return_scores else tokens
+    scores = scores / temperature
     if top_k and top_k > 0:
-        v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)), dim=-1)
-        scaled[scaled < v[:, -1:]] = -torch.inf
+        v, _ = torch.topk(scores, min(top_k, scores.size(-1)), dim=-1)
+        scores[scores < v[:, -1:]] = -torch.inf
     if top_p is not None and top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(scaled, descending=False)
+        sorted_logits, sorted_indices = torch.sort(scores, descending=False)
         cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
         sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
         sorted_indices_to_remove[..., -1:] = 0  # keep at least one token
         indices_to_remove = sorted_indices_to_remove.scatter(
             1, sorted_indices, sorted_indices_to_remove
         )
-        scaled = scaled.masked_fill(indices_to_remove, -torch.inf)
-    probs = F.softmax(scaled, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
-
-
-def decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer):
-    """Per-sequence block-walk over generated slots → EOS-trimmed decoded strings.
-
-    Generated tokens are contiguous within each BLOCK_SIZE block but blocks may
-    be separated by unused slots; all sequences share the same block layout
-    starting at ``padded_len``. Walks each sequence using its own
-    ``num_generated`` count, trims at the first EOS, and decodes.
-    """
-    results = []
-    for b in range(result.shape[0]):
-        gen_ids_list = []
-        block_start = padded_len
-        remaining = num_generated[b].item()
-        while remaining > 0:
-            take = min(remaining, BLOCK_SIZE)
-            for j in range(take):
-                gen_ids_list.append(result[b, block_start + j].item())
-            remaining -= take
-            block_start += BLOCK_SIZE
-        gen_ids = torch.tensor(gen_ids_list)
-        if eos_ids is not None:
-            eos_pos = torch.isin(gen_ids, eos_ids).nonzero(as_tuple=True)[0]
-            if len(eos_pos) > 0:
-                gen_ids = gen_ids[: eos_pos[0].item()]
-        results.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
-    return results
+        scores = scores.masked_fill(indices_to_remove, -torch.inf)
+    probs = F.softmax(scores, dim=-1)
+    tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+    return (tokens, scores) if return_scores else tokens
 
 
 def generate(
-    run_forward_fn: Callable,
+    run_forward_fn: Optional[Callable],
     model,
-    tokenizer,
-    prompts,
-    max_new_tokens,
+    input_ids,
+    max_new_tokens=None,
+    *,
+    attention_mask=None,
+    generation_config=None,
+    max_length=None,
+    min_new_tokens=None,
     do_sample=None,
     temperature=None,
     top_k=None,
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
+    prefill_fn: Optional[Callable] = None,
+    decode_fn: Optional[Callable] = None,
+    token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
+    **kwargs,
 ):
-    """Model-agnostic generation with padded 64-block decode.
+    """Model-agnostic generation: optional chunked prefill, then token decode.
 
     When attached to a model via ``auto_spyre_model.py`` (which binds
-    ``run_forward_fn`` to the adapter module's ``_run_forward``), the
-    ``run_forward_fn`` parameter drops out of the public signature, so callers
-    invoke it as::
+    ``run_forward_fn`` to the adapter module's ``_run_forward``), callers use
+    the stock input and tensor-output shape::
 
-        model.generate(tokenizer, ["Hello!"], max_new_tokens=32, **kwargs)
+        encoded = tokenizer(["Hello!"], return_tensors="pt", padding=True)
+        sequences = model.generate(**encoded, max_new_tokens=32, **kwargs)
+
+    Ordinary contiguous left or right caller padding is removed according to
+    ``attention_mask``. Real tokens are then right-aligned and left block-padded
+    for the Spyre scheduler. Returned sequences preserve the caller's original
+    input prefix and append logical generated tokens; internal block padding is
+    never returned. With ``return_dict_in_generate=True``, returns stock HF's
+    ``GenerateDecoderOnlyOutput`` and optionally per-step processed ``scores``
+    and raw ``logits`` on CPU, cropped to the configured vocabulary size.
 
     Sampling and stop parameters follow stock-HF precedence:
     ``explicit kwarg > model.generation_config > HF global default``. Leaving a
@@ -1430,28 +1978,38 @@ def generate(
     config (e.g. ``do_sample=False`` for deterministic greedy on a model whose
     config bakes in sampling).
 
-    ``max_new_tokens`` is REQUIRED and is not resolved from config: HF's
-    default length goes through ``max_length`` (total prompt+new), which this
-    decode loop does not implement. Callers must state the new-token budget.
+    Length parameters use stock semantics: ``max_new_tokens`` takes precedence,
+    while ``max_length`` limits the total caller-visible sequence length. If
+    neither is configured, the HF model-agnostic default generates 20 tokens.
+    ``min_new_tokens`` suppresses EOS until the requested minimum is reached.
 
     Args:
         run_forward_fn: ``fn(model, input_ids, position_ids, attn_mask,
-            key_caches, value_caches, is_filling, token_index,
-            cache_position) -> logits``
+            key_caches, value_caches, cache_index)
+            -> logits``
         model: Prepared HF model on Spyre (supplies ``generation_config``).
-        tokenizer: HF tokenizer.
-        prompts: List of prompt strings.
-        max_new_tokens: Number of tokens to generate (required).
+        input_ids: Integer token IDs with shape ``[batch, sequence]``.
+        max_new_tokens: Maximum number of continuation tokens.
+        attention_mask: Optional binary mask with the same shape as ``input_ids``.
+        generation_config: Optional HF ``GenerationConfig`` override.
+        max_length: Maximum total returned sequence length.
+        min_new_tokens: Minimum continuation length before EOS stopping.
         do_sample: Sampling vs greedy.
         temperature: Sampling temperature.
         top_k: Top-k filtering (0/None disables).
         top_p: Nucleus (top-p) filtering (1.0 disables).
         eos_token_id: Override stop token(s); scalar or list. Omit to defer to
-            config/tokenizer eos; pass ``None`` to disable EOS stopping (matches
+            generation config; pass ``None`` to disable EOS stopping (matches
             stock ``generate()``).
         timing: Print per-token latency.
+        prefill_chunk_size (via generation_config or kwargs): Query length for
+            each prefill chunk. Falls back to the adapter's configured chunk
+            size, or one-shot prefill when the adapter has no override.
     """
     overrides = {
+        "max_new_tokens": max_new_tokens,
+        "max_length": max_length,
+        "min_new_tokens": min_new_tokens,
         "do_sample": do_sample,
         "temperature": temperature,
         "top_k": top_k,
@@ -1461,41 +2019,93 @@ def generate(
     # (disable EOS) is distinguishable from "unspecified" (defer to config).
     if eos_token_id is not _UNSET:
         overrides["eos_token_id"] = eos_token_id
-    params = _resolve_generation_params(model, tokenizer, overrides)
-    do_sample = params["do_sample"]
-    temperature = params["temperature"]
-    top_k = params["top_k"]
-    top_p = params["top_p"]
-    eos_ids = params["eos_ids"]
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    # Force left-padding: with right-padding, shorter sequences end with
-    # padding tokens, and logits[:, -1, :] would predict from a pad position.
-    # Left-padding aligns all sequences to end at the same position.
-    encoded = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        return_attention_mask=True,
+    has_default_max_length = (
+        max_length is None
+        and (generation_config is None or generation_config.max_length is None)
+        and model.generation_config.max_length is None
     )
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded["attention_mask"]
+    has_default_min_length = (
+        "min_length" not in kwargs
+        and (generation_config is None or generation_config.min_length is None)
+        and model.generation_config.min_length is None
+    )
+    cfg, eos_ids, pad_token_id = _resolve_generation_params(
+        model, generation_config, overrides, kwargs
+    )
+
+    prefill_chunk_size = getattr(cfg, "prefill_chunk_size", None)
+    if prefill_chunk_size is None:
+        prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    if prefill_chunk_size is not None and (
+        isinstance(prefill_chunk_size, bool)
+        or not isinstance(prefill_chunk_size, int)
+        or prefill_chunk_size <= 0
+        or prefill_chunk_size % BLOCK_SIZE != 0
+    ):
+        raise ValueError(
+            f"prefill_chunk_size must be a positive multiple of {BLOCK_SIZE}, "
+            f"got {prefill_chunk_size!r}"
+        )
+
+    # Multimodal prefill hooks consume the complete prompt and token-aligned
+    # processor inputs together, so keep them one-shot and use the SDPA tile
+    # extent. Ordinary text models may opt into chunked prefill.
+    chunked_prefill = prefill_fn is None and prefill_chunk_size is not None
+    pad_to_multiple = (
+        _SDPA_MAX_SEQUENCE_TILE_SIZE
+        if prefill_fn is not None
+        else prefill_chunk_size or BLOCK_SIZE
+    )
+    normalized = normalize_generation_inputs(
+        input_ids, attention_mask, pad_to_multiple=pad_to_multiple
+    )
+    orig_input_ids = normalized.original_input_ids
+    input_ids = normalized.input_ids
+    padded_len = normalized.padded_len
+    prompt_offsets = normalized.prompt_offsets
+    position_ids = normalized.position_ids
+    normalized_token_inputs = {
+        name: normalized.normalize_token_aligned(value, pad_value=pad_value)
+        for name, (value, pad_value) in (token_aligned_inputs or {}).items()
+    }
+
+    input_length = orig_input_ids.shape[1]
+    cfg = model._prepare_generated_length(
+        generation_config=cfg,
+        has_default_max_length=has_default_max_length,
+        has_default_min_length=has_default_min_length,
+        model_input_name="input_ids",
+        input_ids_length=input_length,
+        inputs_tensor=orig_input_ids,
+    )
+    model._validate_generated_length(
+        cfg,
+        input_ids_length=input_length,
+        has_default_max_length=has_default_max_length,
+    )
+    effective_max_new_tokens = cfg.max_length - input_length
+    min_new_tokens = cfg.min_new_tokens or 0
+    begin_suppress_index = generation_begin_index(input_length, cfg.forced_bos_token_id)
+
+    if prefill_fn is None and run_forward_fn is None:
+        raise ValueError("run_forward_fn or prefill_fn must be provided")
+    if decode_fn is None and run_forward_fn is None and effective_max_new_tokens > 1:
+        raise ValueError("run_forward_fn or decode_fn must be provided")
+
     batch_size = input_ids.shape[0]
-    prompt_length = input_ids.shape[1]
+    vocab_size = text_config(model.config).vocab_size
+    collect_scores = bool(cfg.return_dict_in_generate and cfg.output_scores)
+    collect_logits = bool(cfg.return_dict_in_generate and cfg.output_logits)
+    generation_scores = []
+    generation_logits = []
 
-    # Per-sequence actual prompt length (excluding tokenizer left-padding)
-    actual_prompt_lengths = attention_mask.sum(dim=1)  # [B]
+    query_chunk_size = prefill_chunk_size if chunked_prefill else padded_len
+    assert query_chunk_size is not None
 
-    # Block-pad to a BLOCK_SIZE multiple; real tokens right-aligned (positions
-    # 0..actual_len-1 at padded indices prompt_offsets[b]..padded_len-1).
-    max_cache_len = (
-        math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
-        + math.ceil(max_new_tokens / BLOCK_SIZE) * BLOCK_SIZE
-    )
-    input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_prompt_lengths
+    max_cache_len = generation_cache_len(padded_len, effective_max_new_tokens)
+    prefill_kv_len = (
+        _sdpa_compatible_kv_length(padded_len) if chunked_prefill else max_cache_len
     )
 
     # Initialize empty KV caches. Per-layer shapes come from the model
@@ -1507,123 +2117,176 @@ def generate(
         model, batch_size, max_cache_len, model_d_type
     )
 
-    # Decode state
-    result = input_ids.clone()
+    # Decode state. Every decode step writes exactly one token at
+    # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
+    previous_tokens = None
     current_cache_len = padded_len
-    tokens_in_block = BLOCK_SIZE - 1
-    decode_pos = None
-    fill_mask_device = None
 
     times_list = []
     finished = torch.zeros(batch_size, dtype=torch.bool)
-    num_generated = torch.zeros(batch_size, dtype=torch.long)
+    generated_columns = []
 
-    for i in range(max_new_tokens):
+    for i in range(effective_max_new_tokens):
         t0 = time.time()
 
         if i == 0:
             # --- PREFILL ---
-            prefill_mask = build_prefill_mask(
-                batch_size,
-                padded_len,
-                max_cache_len,
-                prompt_offsets,
-                dtype=model_d_type,
+            # Keep prefill independent of the larger decode capacity.  Most
+            # prompt lengths remain square (including exact 8K/32K); irregular
+            # lengths gain only enough inactive KV columns for the selected
+            # compiler block to divide Lk.  These prefix views share storage,
+            # so in-place KV updates still seed the full decode caches.
+            # Preserve the original tensors for one-shot prefill. Even a
+            # full-extent slice is a view, and an in-place compiled update
+            # through that view does not reliably seed the tensors consumed by
+            # decode on Spyre.
+            prefill_key_caches = _prefill_cache_inputs(
+                key_caches, prefill_kv_len, chunked_prefill
             )
-            logits = run_forward_fn(
-                model,
-                input_ids.to(DEVICE),
-                position_ids.to(DEVICE),
-                prefill_mask.to(DEVICE),
-                key_caches,
-                value_caches,
-                is_filling=False,
-                token_index=0,
-                cache_position=0,
+            prefill_value_caches = _prefill_cache_inputs(
+                value_caches, prefill_kv_len, chunked_prefill
             )
-            logits_cpu = logits.to("cpu")
-            next_logits = logits_cpu[:, -1, :]
-            current_cache_len = padded_len
-            # Initialize per-sequence decode_pos. After the first +BLOCK_SIZE
-            # increment (before the first expansion forward), position 0 of
-            # the block must equal actual_prompt_lengths[b] for that row.
-            # So initial[b, j] = actual_prompt_lengths[b] + j - BLOCK_SIZE.
-            decode_pos = torch.zeros((batch_size, BLOCK_SIZE), dtype=torch.long)
-            for b in range(batch_size):
-                actual_len = actual_prompt_lengths[b].item()
-                for j in range(BLOCK_SIZE):
-                    decode_pos[b, j] = actual_len + j - BLOCK_SIZE
-
-        else:
-            is_filling = tokens_in_block > 0
-            next_input = result[:, -BLOCK_SIZE:].to(DEVICE)
-
-            if is_filling:
-                fill_pos = current_cache_len - BLOCK_SIZE + tokens_in_block
-                logits = run_forward_fn(
-                    model,
-                    next_input,
-                    decode_pos.to(DEVICE),  # type: ignore[union-attr]
-                    fill_mask_device,
-                    key_caches,
-                    value_caches,
-                    is_filling=True,
-                    token_index=tokens_in_block,
-                    cache_position=fill_pos,
-                )
-                logits_cpu = logits.to("cpu")
-                grab_idx = BLOCK_SIZE - tokens_in_block
-                next_logits = logits_cpu[:, -grab_idx, :]
-
-            else:
-                current_cache_len += BLOCK_SIZE
-                decode_pos = decode_pos + BLOCK_SIZE  # type: ignore[assignment, operator]
-                exp_mask = build_expansion_mask(
+            if prefill_fn is not None:
+                prefill_mask = build_prefill_mask(
                     batch_size,
-                    BLOCK_SIZE,
-                    max_cache_len,
-                    current_cache_len,
+                    padded_len,
+                    prefill_kv_len,
                     prompt_offsets,
                     dtype=model_d_type,
                 )
-                logits = run_forward_fn(
+                logits = prefill_fn(
+                    model=model,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=prefill_mask,
+                    key_caches=prefill_key_caches,
+                    value_caches=prefill_value_caches,
+                    cache_index=make_cache_index(0, padded_len, DEVICE),
+                    **normalized_token_inputs,
+                )
+            else:
+                # Keep Lk fixed at the complete prefill extent while advancing
+                # Lq. Future cache slots are zero and masked, and fixed shapes
+                # avoid compiling one attention graph for every prefix length.
+                for chunk_start in range(0, padded_len, query_chunk_size):
+                    chunk_end = chunk_start + query_chunk_size
+                    prefill_mask = build_prefill_mask(
+                        batch_size,
+                        query_chunk_size,
+                        prefill_kv_len,
+                        prompt_offsets,
+                        dtype=model_d_type,
+                        query_start=chunk_start,
+                    )
+                    logits = run_forward_fn(  # type: ignore[misc]
+                        model,
+                        input_ids[:, chunk_start:chunk_end].to(DEVICE),
+                        position_ids[:, chunk_start:chunk_end].to(DEVICE),
+                        prefill_mask.to(DEVICE),
+                        prefill_key_caches,
+                        prefill_value_caches,
+                        cache_index=make_cache_index(
+                            chunk_start, query_chunk_size, DEVICE
+                        ),
+                    )
+            # Only the last chunk's logits matter for next-token selection.
+            next_logits = logits.to("cpu")[:, -1, :]
+            current_cache_len = padded_len
+
+        else:
+            # --- DECODE: one token in, one cache slot written ---
+            # The token to feed is the one selected by the previous step.
+            assert previous_tokens is not None
+            next_input = previous_tokens.unsqueeze(1).to(DEVICE)
+            # Absolute position of that token per sequence: it follows the
+            # prompt's real tokens plus everything generated so far. Equivalent to
+            # its cache column minus the sequence's left-padding offset.
+            decode_pos = (current_cache_len - prompt_offsets).unsqueeze(1)  # [B, 1]
+            decode_mask = build_decode_mask(
+                batch_size,
+                max_cache_len,
+                current_cache_len,
+                prompt_offsets,
+                dtype=model_d_type,
+            )
+            if decode_mask_heads := getattr(
+                model, "_spyre_decode_mask_num_heads", None
+            ):
+                decode_mask = _materialize_decode_mask_heads(
+                    decode_mask, decode_mask_heads
+                )
+            cache_index = make_cache_index(current_cache_len, 1, DEVICE)
+            if decode_fn is None:
+                logits = run_forward_fn(  # type: ignore[misc]
                     model,
                     next_input,
-                    decode_pos.to(DEVICE),  # type: ignore[union-attr]
-                    exp_mask.to(DEVICE),
+                    decode_pos.to(DEVICE),
+                    decode_mask.to(DEVICE),
                     key_caches,
                     value_caches,
-                    is_filling=False,
-                    token_index=0,
-                    cache_position=current_cache_len - BLOCK_SIZE,
+                    cache_index=cache_index,
                 )
-                logits_cpu = logits.to("cpu")
-                next_logits = logits_cpu[:, -BLOCK_SIZE, :]
-                fill_mask_device = exp_mask.to(DEVICE)
+            else:
+                logits = decode_fn(
+                    model=model,
+                    input_ids=next_input,
+                    position_ids=decode_pos.to(DEVICE),
+                    attention_mask=decode_mask.to(DEVICE),
+                    key_caches=key_caches,
+                    value_caches=value_caches,
+                    cache_index=cache_index,
+                )
+            next_logits = logits.to("cpu")[:, -1, :]
+            current_cache_len += 1
 
-        # Token selection (CPU)
-        next_tokens = select_next_token(
-            next_logits, do_sample, temperature, top_k, top_p
+        # Crop away Spyre LM-head padding before exposing logits or selecting a
+        # token. Stock generation only sees the model's configured vocabulary.
+        # Upcast to float32, mirroring HF behavior.
+        raw_next_logits = next_logits[:, :vocab_size].float()
+        if collect_logits:
+            generation_logits.append(raw_next_logits)
+
+        # Token selection (CPU). Match HF's MinNewTokensLengthLogitsProcessor
+        # by suppressing every EOS id until the minimum continuation is emitted.
+        processed_logits = raw_next_logits
+        if eos_ids is not None and i < min_new_tokens:
+            processed_logits = processed_logits.clone()
+            processed_logits[:, eos_ids] = -torch.inf
+        next_tokens, processed_scores = select_next_token(
+            processed_logits,
+            cfg.do_sample,
+            cfg.temperature,
+            cfg.top_k,
+            cfg.top_p,
+            cfg.suppress_tokens,
+            cfg.begin_suppress_tokens,
+            cfg.forced_bos_token_id,
+            current_length=input_length + i,
+            begin_suppress_index=begin_suppress_index,
+            return_scores=True,
         )
-
+        if collect_scores:
+            generation_scores.append(processed_scores)
         if timing:
             times_list.append(time.time() - t0)
 
-        # Place token in result (FMS logic)
-        tokens_in_block = (tokens_in_block + 1) % BLOCK_SIZE
-        if tokens_in_block == 0:
-            # Just finished a block, pad for next block
-            result = F.pad(result, (0, BLOCK_SIZE))
-        grab_idx = (BLOCK_SIZE - tokens_in_block) if tokens_in_block > 0 else BLOCK_SIZE
-        result[:, -grab_idx] = next_tokens  # [B]
+        # Finished rows emit padding while unfinished rows continue. Mask using
+        # the previous state so the first EOS token remains in the output.
+        if finished.any():
+            if pad_token_id is None:
+                raise ValueError(
+                    "pad_token_id must be configured when batch rows finish at different steps"
+                )
+            next_tokens = next_tokens.masked_fill(finished, pad_token_id)
+        generated_columns.append(next_tokens.clone())
+        previous_tokens = next_tokens
+
         if eos_ids is not None:
             finished |= torch.isin(next_tokens, eos_ids)
-        num_generated += (~finished).long()
 
         if finished.all():
             break
 
-    # Timing
     if timing and times_list:
         print(f"\nFirst-token latency: {times_list[0]*1000:.3f} ms")
         if len(times_list) > 1:
@@ -1631,7 +2294,19 @@ def generate(
             print(f"Avg next-token latency: {avg*1000:.3f} ms")
         print("Per-token: " + ", ".join(f"{t*1000:.1f}" for t in times_list) + " ms")
 
-    return decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer)
+    if generated_columns:
+        generated_ids = torch.stack(generated_columns, dim=1)
+        sequences = torch.cat([orig_input_ids, generated_ids], dim=1).to(torch.long)
+    else:
+        sequences = orig_input_ids.to(torch.long)
+    if not cfg.return_dict_in_generate:
+        return sequences
+    return GenerateDecoderOnlyOutput(
+        sequences=sequences,  # type: ignore[arg-type]
+        scores=tuple(generation_scores) if generation_scores else None,
+        logits=tuple(generation_logits) if generation_logits else None,
+        past_key_values=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1639,34 +2314,124 @@ def generate(
 # ---------------------------------------------------------------------------
 
 
-def make_standard_gqa_block(layer, is_res_mul: bool | None = None):
-    """Compiled block for standard GQA models (separate QKV, no multipliers).
+def _standard_gqa_attention_dim_names(query, key, value):
+    """Return named-dim declarations and per-tensor names for Spyre SDPA.
 
-    Shared by Llama, Qwen2, Mistral, and other standard GQA adapters.
+    Names match ``spyre__sdpa_overrideable``; unit axes are omitted.
     """
-    attn = layer.self_attn
-    mlp = layer.mlp
-    input_ln = layer.input_layernorm
-    post_attn_ln = layer.post_attention_layernorm
-    v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
+    q_shape = tuple(int(d) for d in query.shape)
+    k_shape = tuple(int(d) for d in key.shape)
+    v_shape = tuple(int(d) for d in value.shape)
+    for name, shape in [("query", q_shape), ("key", k_shape), ("value", v_shape)]:
+        if len(shape) != 4:
+            raise ValueError(f"GQA requires rank-4 {name}, got {shape}")
+    if q_shape[0] != k_shape[0] or k_shape[:3] != v_shape[:3]:
+        raise ValueError(
+            f"Q/K/V batch or K/V prefix mismatch: {q_shape}, {k_shape}, {v_shape}"
+        )
+    if q_shape[3] != k_shape[3]:
+        raise ValueError(f"Q/K head_dim mismatch: {q_shape}, {k_shape}")
+    if q_shape[1] % k_shape[1] != 0:
+        raise ValueError(
+            f"num_kvheads must divide num_heads: {q_shape[1]}, {k_shape[1]}"
+        )
 
-    def block_forward(
+    declarations = (
+        ("_b", q_shape[0]),
+        ("num_heads", q_shape[1]),
+        ("num_kvheads", k_shape[1]),
+        ("max_seqlen_q", q_shape[2]),
+        ("max_seqlen_kv", k_shape[2]),
+        ("head_dim", q_shape[3]),
+        ("value_head_dim", v_shape[3]),
+    )
+    logical_names = (
+        ("_b", "num_heads", "max_seqlen_q", "head_dim"),
+        ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
+        ("_b", "num_kvheads", "max_seqlen_kv", "value_head_dim"),
+    )
+    tensor_names = tuple(
+        [name for size, name in zip(shape, names, strict=True) if size != 1]
+        for shape, names in zip((q_shape, k_shape, v_shape), logical_names, strict=True)
+    )
+    return declarations, tensor_names
+
+
+def _apply_standard_gqa_attention_dim_names(
+    query, key, value, declare_tensor_dim, name_tensor_dims
+):
+    declarations, tensor_names = _standard_gqa_attention_dim_names(query, key, value)
+    for name, size in declarations:
+        declare_tensor_dim(name, size)
+    for tensor, names in zip((query, key, value), tensor_names, strict=True):
+        name_tensor_dims(tensor, names)
+
+
+@contextmanager
+def _named_standard_gqa_attention_inputs(query, key, value):
+    """Name eager Q/K/V inputs for the immediately following compiled SDPA."""
+    if query.device.type != "spyre":
+        # CPU adapter tests exercise the same block without the Spyre package.
+        yield
+        return
+
+    # Access the module registered by PyTorch's Spyre backend auto-loader.
+    # Importing torch_spyre here can recurse through backend initialization.
+    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
+
+    try:
+        _apply_standard_gqa_attention_dim_names(
+            query,
+            key,
+            value,
+            named_dims.declare_tensor_dim,
+            named_dims.name_tensor_dims,
+        )
+        yield
+    finally:
+        # Compilation consumes and clears these globals itself. A cache-hit
+        # execution does not, so clear them here to avoid leaking annotations
+        # into a later, unrelated compilation.
+        named_dims.reset()
+
+
+class StandardGQAAttention(nn.Module):
+    """Split into ``pre_attn`` and ``attn_core`` for eager dim-naming."""
+
+    def __init__(self, attn):
+        super().__init__()
+        self.q_proj = attn.q_proj
+        self.k_proj = attn.k_proj
+        self.v_proj = attn.v_proj
+        self.o_proj = attn.o_proj
+        self.head_dim = attn.head_dim
+        self.v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
+        self.scaling = attn.scaling
+
+    def pre_attn(
+        self,
         hidden_states,
         selected_freqs,
-        attn_mask,
         key_cache,
         value_cache,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     ):
-        residual = hidden_states
-        h = input_ln(hidden_states)
-
-        bsz, seq_len, _ = h.shape
-        q = attn.q_proj(h).view(bsz, seq_len, -1, attn.head_dim).transpose(1, 2)
-        k = attn.k_proj(h).view(bsz, seq_len, -1, attn.head_dim).transpose(1, 2)
-        v = attn.v_proj(h).view(bsz, seq_len, -1, v_head_dim).transpose(1, 2)
+        bsz, seq_len, _ = hidden_states.shape
+        q = (
+            self.q_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.v_head_dim)
+            .transpose(1, 2)
+        )
 
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
@@ -1676,41 +2441,125 @@ def make_standard_gqa_block(layer, is_res_mul: bool | None = None):
             v,
             key_cache,
             value_cache,
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
+        return q, key_cache, value_cache
 
+    def attn_core(self, q, key_cache, value_cache, attn_mask):
+        bsz, _, seq_len, _ = q.shape
         attn_out = F.scaled_dot_product_attention(
             q,
             key_cache,
             value_cache,
             attn_mask=attn_mask,
             dropout_p=0.0,
-            scale=attn.scaling,
+            scale=self.scaling,
             enable_gqa=True,
         )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        attn_out = attn.o_proj(attn_out)
+        return self.o_proj(attn_out)
 
-        res_mult = None
-        if not is_res_mul:
-            h = residual + attn_out
+    def forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        value_cache,
+        cache_index,
+    ):
+        q, key_cache, value_cache = self.pre_attn(
+            hidden_states, selected_freqs, key_cache, value_cache, cache_index
+        )
+        attn_out = self.attn_core(q, key_cache, value_cache, attn_mask)
+        return attn_out, key_cache, value_cache
+
+
+class StandardGQABlock(nn.Module):
+    """Two compiled regions with an eager dim-naming boundary between them."""
+
+    def __init__(self, layer, is_res_mul: bool | None = None):
+        super().__init__()
+        self.self_attn = StandardGQAAttention(layer.self_attn)
+        self.mlp = layer.mlp
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.residual_multiplier = layer.residual_multiplier if is_res_mul else None
+        self.train(layer.training)
+        # Compile the two regions independently. torch.compile is lazy, so
+        # tracing still happens on the first forward (after the model is moved
+        # to Spyre), exactly as when the whole block was compiled.
+        self._pre_attn = torch.compile(self._region_pre_attn, dynamic=False)
+        self._attention_tail = torch.compile(self._region_attention_tail, dynamic=False)
+
+    def _region_pre_attn(
+        self,
+        hidden_states,
+        selected_freqs,
+        key_cache,
+        value_cache,
+        cache_index,
+    ):
+        h = self.input_layernorm(hidden_states)
+        return self.self_attn.pre_attn(
+            h, selected_freqs, key_cache, value_cache, cache_index
+        )
+
+    def _region_attention_tail(
+        self, hidden_states, q, key_cache, value_cache, attn_mask
+    ):
+        attn_out = self.self_attn.attn_core(q, key_cache, value_cache, attn_mask)
+
+        if self.residual_multiplier is None:
+            h = hidden_states + attn_out
         else:
-            res_mult = layer.residual_multiplier
-            h = residual + attn_out * res_mult
+            h = hidden_states + attn_out * self.residual_multiplier
 
         residual = h
-        h = post_attn_ln(h)
-        h = mlp(h)
-        if not is_res_mul:
+        h = self.post_attention_layernorm(h)
+        h = self.mlp(h)
+        if self.residual_multiplier is None:
             h = residual + h
         else:
-            h = residual + h * res_mult
+            h = residual + h * self.residual_multiplier
+        return h
 
+    def forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        value_cache,
+        cache_index,
+    ):
+        q, key_cache, value_cache = self._pre_attn(
+            hidden_states, selected_freqs, key_cache, value_cache, cache_index
+        )
+        with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
+            h = self._attention_tail(
+                hidden_states, q, key_cache, value_cache, attn_mask
+            )
         return h, key_cache, value_cache
 
-    return torch.compile(block_forward, dynamic=False)
+
+def make_standard_gqa_block(layer, is_res_mul: bool | None = None):
+    """Build one standard GQA block; its two regions are compiled internally."""
+    return StandardGQABlock(layer, is_res_mul)
+
+
+def prepare_standard_gqa_blocks(layers, is_res_mul: bool | None = None):
+    """Replace decoder layers with registered Spyre blocks.
+
+    Each block compiles its two regions internally and is returned un-compiled
+    at the top level (the backbone driver still calls ``block(h, ...)``).
+    """
+    blocks = []
+    for i, layer in enumerate(list(layers)):
+        block = StandardGQABlock(layer, is_res_mul)
+        layers[i] = block
+        blocks.append(block)
+    return blocks
 
 
 def make_decoder_block(
@@ -1728,6 +2577,7 @@ def make_decoder_block(
     head_dim,
     scale,
     pre_ln=True,
+    query_scale=None,
 ):
     """Compiled causal-decoder block for non-RoPE (learned-abs-pos) models.
 
@@ -1745,13 +2595,15 @@ def make_decoder_block(
       - **MHA** — kv heads == attention heads, so no ``enable_gqa=True``;
       - **explicit ``scale``** and a configurable ``pre_ln`` LN placement
         (``True`` = norm before each sublayer, as in GPT-2 / BLOOM / OPT≥1.3B;
-        ``False`` = norm after, as in OPT-350m).
+        ``False`` = norm after, as in OPT-350m). ``query_scale`` optionally
+        applies the factor directly to Q before SDPA, preserving OPT's stock
+        floating-point operation order while using ``scale=1.0`` in SDPA.
 
     Block signature matches the decoder harness::
 
         block_forward(hidden_states, selected_freqs, attn_mask,
-                      key_cache, value_cache, is_filling, token_index,
-                      cache_position) -> (h, key_cache, value_cache)
+                      key_cache, value_cache, cache_index)
+                      -> (h, key_cache, value_cache)
 
     Dropout is skipped — these adapters are eval-only. ``act`` is the (possibly
     patched) activation module; the FFN is passed decomposed as
@@ -1765,16 +2617,17 @@ def make_decoder_block(
         attn_mask,
         key_cache,
         value_cache,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     ):
         # --- attention sublayer ---
         residual = hidden_states
         h = attn_ln(hidden_states) if pre_ln else hidden_states
 
         bsz, seq_len, _ = h.shape
-        q = q_proj(h).view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
+        q = q_proj(h)
+        if query_scale is not None:
+            q = q * query_scale
+        q = q.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
         k = k_proj(h).view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
         v = v_proj(h).view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
 
@@ -1783,9 +2636,7 @@ def make_decoder_block(
             v,
             key_cache,
             value_cache,
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
         attn_out = F.scaled_dot_product_attention(
@@ -1823,9 +2674,7 @@ def standard_gqa_backbone_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """Standard GQA backbone: embedding, RoPE, compiled blocks, norm.
 
@@ -1844,12 +2693,10 @@ def standard_gqa_backbone_forward(
             attn_mask,
             key_caches[i],
             value_caches[i],
-            is_filling,
-            token_index,
-            cache_position,
+            cache_index,
         )
 
-    h = backbone.norm(h)
+    h = model._spyre_compiled_norm(h)
     return h
 
 
@@ -1860,9 +2707,7 @@ def standard_gqa_forward(
     attn_mask,
     key_caches,
     value_caches,
-    is_filling,
-    token_index,
-    cache_position,
+    cache_index,
 ):
     """Standard GQA causal-LM forward: backbone + LM head."""
     h = standard_gqa_backbone_forward(
@@ -1872,9 +2717,7 @@ def standard_gqa_forward(
         attn_mask,
         key_caches,
         value_caches,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
     )
     return model.lm_head(h)
 
@@ -2125,12 +2968,23 @@ def encoder_backbone_forward(model, input_ids, attn_mask, position_ids, token_ty
 
 def prepare_rope_and_heads(model):
     cfg = text_config(model.config)
-    assert_spyre_dimensions(
-        cfg, model_name=getattr(cfg, "name_or_path", "") or "<unknown>"
-    )
     orig_head_dim = (
         getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
     )
+    local_query_heads = _local_query_head_count(model, orig_head_dim)
+    local_kv_heads = {shape[0] for shape in kv_cache_shapes(model)}
+    incompatible_kv_heads = sorted(
+        num_kv_heads
+        for num_kv_heads in local_kv_heads
+        if num_kv_heads <= 0 or local_query_heads % num_kv_heads != 0
+    )
+    if incompatible_kv_heads:
+        raise ValueError(
+            "local query heads must be divisible by every local KV-head count, "
+            f"got query_heads={local_query_heads}, "
+            f"kv_heads={incompatible_kv_heads}"
+        )
+    model._spyre_decode_mask_num_heads = local_query_heads
 
     # RoPE reshape [B,L,H,2,D/2] requires D/2 >= BLOCK_SIZE.
     # Compute minimum stick-aligned head_dim: round up to next multiple of 2*BLOCK_SIZE.
@@ -2155,19 +3009,17 @@ def prepare_rope_and_heads(model):
     )
 
 
-def prepare_standard_gqa(model, rmsnorm_cls):
+def prepare_standard_gqa(model):
     """Apply Spyre adaptations for standard GQA models in-place.
 
     Args:
         model: HF model (on CPU, eval mode, requires_grad=False).
-        rmsnorm_cls: The model's RMSNorm class to patch.
     """
     prepare_rope_and_heads(model)
-    patch_rmsnorm(rmsnorm_cls)
     pad_lm_head(model)
-    model._spyre_compiled_blocks = [
-        make_standard_gqa_block(layer) for layer in get_backbone(model).layers
-    ]
+    backbone = get_backbone(model)
+    model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers)
+    model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2202,8 +3054,8 @@ def prefill_embed(
 
     Args:
         run_backbone_forward_fn: ``fn(model, input_ids, position_ids,
-            attn_mask, key_caches, value_caches, is_filling, token_index,
-            cache_position) -> [B, padded_len, H]``. Pass the adapter's
+            attn_mask, key_caches, value_caches, cache_index)
+            -> [B, padded_len, H]``. Pass the adapter's
             ``_run_backbone_forward`` (or ``standard_gqa_backbone_forward``).
         model: Prepared HF backbone on Spyre (loaded via ``AutoModel``).
         input_ids: ``[B, L]`` token ids on CPU. Right-padded to ``L`` by
@@ -2263,9 +3115,7 @@ def prefill_embed(
         mask.to(DEVICE),
         key_caches,
         value_caches,
-        is_filling=False,
-        token_index=0,
-        cache_position=0,
+        cache_index=make_cache_index(0, padded_len, DEVICE),
     )
 
     # Crop the block-pad back off; tokenizer pad stays so pooling can mask it.
@@ -2288,9 +3138,9 @@ def prefill_encoder(
 ):
     """One-shot prefill for encoder-only (BERT-style) embedding models.
 
-    Counterpart of ``prefill_embed`` for models with no KV cache and no RoPE.
-    (``prefill_embed`` reads `model.config.num_key_value_heads`` and
-    allocates KV caches, which ``BertConfig`` and similar encoder configs do not provide.
+    Counterpart of ``prefill_embed`` for models with no KV cache and no RoPE:
+    ``prefill_embed`` reads ``num_key_value_heads`` and allocates KV caches,
+    which encoder configs like ``BertConfig`` do not provide.
 
     Device split: same as ``prefill_embed``. The auxiliary tensors
     (padding, ``position_ids``, ``token_type_ids``, ``attn_mask``) are built on
@@ -2311,6 +3161,33 @@ def prefill_encoder(
         ``last_hidden_state``: ``[B, L, H]`` on Spyre, cropped back to the input
         ``L``. Caller moves to CPU as needed.
     """
+    if input_ids.ndim != 2:
+        raise ValueError(
+            f"input_ids must have shape [batch, sequence], got {input_ids.shape}"
+        )
+    if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
+        raise ValueError(
+            "attention_mask must have the same [batch, sequence] shape as input_ids"
+        )
+    if input_ids.shape[1] == 0:
+        raise ValueError("Encoder inputs must contain at least one token")
+    if token_type_ids is not None and token_type_ids.shape != input_ids.shape:
+        raise ValueError(
+            "token_type_ids must have the same [batch, sequence] shape as input_ids"
+        )
+
+    # HF pipelines may place inputs on ``model.device`` (Spyre). Padding and
+    # position construction happen on CPU; only completed graph inputs move to
+    # Spyre below.
+    input_ids = input_ids.to("cpu")
+    attention_mask = attention_mask.to("cpu")
+    if token_type_ids is not None:
+        token_type_ids = token_type_ids.to("cpu")
+
+    # ``actual_lengths`` and position construction below assume right padding.
+    if torch.any(attention_mask[:, 1:] > attention_mask[:, :-1]):
+        raise ValueError("Encoder task inputs must be right-padded")
+
     bsz, seq_len = input_ids.shape
 
     # Pad to BLOCK_SIZE multiple on the right
@@ -2339,9 +3216,14 @@ def prefill_encoder(
             else token_type_ids
         )
 
-    # Bidirectional mask: real tokens attend to all other real tokens
+    # Bidirectional mask: real tokens attend to all other real tokens. Match the
+    # model dtype because SDPA requires a floating-point mask to match q/k/v.
     mask = build_prefill_mask_right_padded(
-        bsz, padded_len, actual_lengths, is_causal=False
+        bsz,
+        padded_len,
+        actual_lengths,
+        is_causal=False,
+        dtype=get_model_dtype(model),
     )
 
     h = run_encoder_forward_fn(
@@ -2358,39 +3240,129 @@ def prefill_encoder(
     return h
 
 
-# ---------------------------------------------------------------------------
-# Cross-encoder reranker prefill driver (XLM-RoBERTa / BGE reranker family)
-# ---------------------------------------------------------------------------
-
-
-def prefill_reranker(
+def prefill_masked_lm(
     run_encoder_forward_fn: Callable,
     model,
     input_ids,
     attention_mask,
     token_type_ids=None,
-):
-    """One-shot prefill for cross-encoder reranker models.
+) -> torch.Tensor:
+    """Run an encoder on Spyre and its masked-LM head on CPU."""
+    last_hidden_state = prefill_encoder(
+        run_encoder_forward_fn,
+        model,
+        input_ids,
+        attention_mask,
+        token_type_ids=token_type_ids,
+    )
 
-    Runs the encoder backbone on Spyre via ``prefill_encoder``,
-    then applies the classification head (``model.classifier``) to produce a
-    scalar relevance score per query-document pair.
+    if hasattr(model, "cls"):
+        head = model.cls
+        head_device = next(head.parameters()).device
+        logits: torch.Tensor = head(last_hidden_state.to(head_device))
+    elif hasattr(model, "head") and hasattr(model, "decoder"):
+        head_device = next(model.head.parameters()).device
+        hidden = model.head(last_hidden_state.to(head_device))
+        logits = model.decoder(hidden)
+    elif hasattr(model, "lm_head"):
+        head = model.lm_head
+        head_device = next(head.parameters()).device
+        logits = head(last_hidden_state.to(head_device))
+    else:
+        raise SpyreUnsupportedModelError(
+            f"Unsupported masked-LM head layout for {type(model).__name__}"
+        )
 
-    The classification head is run outside torch.compile on CPU to avoid:
-    - ``torch.bernoulli`` (Dropout) which the Spyre backend cannot lower.
-    - ``aten.slice`` for CLS extraction which does not lower on Spyre.
-    - ``out_proj: Linear(hidden, 1)`` whose output dim=1 is not stick-aligned.
+    return logits.to("cpu")
+
+
+def prefill_question_answering(
+    run_encoder_forward_fn: Callable,
+    model,
+    input_ids,
+    attention_mask,
+    token_type_ids=None,
+) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """Run an encoder on Spyre and its extractive-QA head on CPU."""
+    last_hidden_state = prefill_encoder(
+        run_encoder_forward_fn,
+        model,
+        input_ids,
+        attention_mask,
+        token_type_ids=token_type_ids,
+    )
+
+    qa_outputs = model.qa_outputs
+    head_device = next(qa_outputs.parameters()).device
+    logits = qa_outputs(last_hidden_state.to(head_device))
+    if logits.shape[-1] != 2:
+        raise SpyreUnsupportedModelError(
+            f"Extractive question answering requires num_labels=2, got {logits.shape[-1]}"
+        )
+    start_logits, end_logits = logits.unbind(dim=-1)
+    return start_logits.to("cpu"), end_logits.to("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Sequence-classification prefill driver
+# ---------------------------------------------------------------------------
+
+
+def prefill_sequence_classification(
+    run_encoder_forward_fn: Callable,
+    model,
+    input_ids,
+    attention_mask,
+    token_type_ids=None,
+) -> torch.Tensor:
+    """Run an encoder on Spyre and its sequence-classification head on CPU."""
+    last_hidden_state = prefill_encoder(
+        run_encoder_forward_fn,
+        model,
+        input_ids,
+        attention_mask,
+        token_type_ids=token_type_ids,
+    )
+
+    classifier = model.classifier
+    cls_device = next(classifier.parameters()).device
+    logits: torch.Tensor = classifier(last_hidden_state.to(cls_device))
+    return logits.to("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Token-classification prefill driver (NER / POS / chunking families)
+# ---------------------------------------------------------------------------
+
+
+def prefill_token_classification(
+    run_encoder_forward_fn: Callable,
+    model,
+    input_ids,
+    attention_mask,
+    token_type_ids=None,
+) -> torch.Tensor:
+    """Run an encoder on Spyre and its token-classification head on CPU.
+
+    Drives the encoder backbone via ``prefill_encoder``, then applies
+    ``model.classifier`` (a single linear layer whose output dim equals
+    ``config.num_labels``) to every token position.  The head is kept on
+    CPU (via ``_spyre_cpu_submodules``) to avoid:
+
+    - ``aten.slice`` (index operations that don't lower on Spyre).
+    - Any Dropout path that uses ``torch.bernoulli``.
 
     Args:
         run_encoder_forward_fn: ``fn(model, input_ids, attn_mask, position_ids,
             token_type_ids) -> [B, padded_len, H]``.
-        model: Prepared ``XLMRobertaForSequenceClassification`` on Spyre.
-        input_ids: ``[B, L]`` token ids on CPU.
-        attention_mask: ``[B, L]`` mask on CPU.
-        token_type_ids: Optional ``[B, L]``. Defaults to all-zeros when None.
+        model: Prepared ``BertForTokenClassification`` (or compatible) on Spyre.
+        input_ids: ``[B, L]`` token ids on CPU. Right-padded by the tokenizer.
+        attention_mask: ``[B, L]`` mask on CPU; 1 for real tokens, 0 for pad.
+        token_type_ids: Optional ``[B, L]`` on CPU. Defaults to all-zeros when
+            None.
 
     Returns:
-        ``scores``: ``[B]`` float32 tensor on CPU — raw logits.
+        ``logits``: ``[B, L, num_labels]`` float32 tensor on CPU.
     """
     last_hidden_state = prefill_encoder(
         run_encoder_forward_fn,
@@ -2400,17 +3372,10 @@ def prefill_reranker(
         token_type_ids=token_type_ids,
     )
 
-    # Pass the full [B, L, H] hidden state to the classifier; .to(cls_device)
-    # moves it off Spyre to avoid aten.slice. The classification head does its
-    # own [:, 0, :] CLS extraction internally.
-
-    # Run the classification head on the same device it lives on
-    # (CPU — kept off Spyre via _spyre_cpu_submodules in prepare_for_spyre).
     classifier = model.classifier
-    cls_device = next(classifier.parameters()).device
-    scores = classifier(last_hidden_state.to(cls_device))  # [B, 1]
-
-    return scores[:, 0].to("cpu")  # [B] raw logits on CPU
+    head_device = next(classifier.parameters()).device
+    logits: torch.Tensor = classifier(last_hidden_state.to(head_device))
+    return logits.to("cpu")
 
 
 # ---------------------------------------------------------------------------

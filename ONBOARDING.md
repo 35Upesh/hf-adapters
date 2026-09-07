@@ -130,7 +130,7 @@ Create `hf_adapters/hf_<model>.py`. Every adapter must expose:
 
 | Export | Purpose |
 |--------|---------|
-| `_run_forward(model, input_ids, position_ids, attn_mask, key_caches, value_caches, is_filling, token_index, cache_position)` | Full forward → logits |
+| `_run_forward(model, input_ids, position_ids, attn_mask, key_caches, value_caches, cache_index)` | Full forward → logits |
 | `_run_backbone_forward(...)` | Same signature → last hidden state (no lm_head). Used by embedding callers |
 | `prepare_for_spyre(model)` | Patch model in-place for Spyre |
 
@@ -152,9 +152,7 @@ def block_forward(
     attn_mask,          # [B, 1, S, cache_len] — float16 causal mask
     key_cache,          # [B, num_kv_heads, max_cache_len, head_dim]
     value_cache,        # [B, num_kv_heads, max_cache_len, v_head_dim]
-    is_filling,         # bool — True=fill mode, False=expand mode
-    token_index,        # int — current write position in cache
-    cache_position,     # [S] — position indices for cache slice
+    cache_index,        # [n] int64 — destination cache positions (indirect scatter)
 ) -> (hidden_states, key_cache, value_cache)
 ```
 
@@ -162,9 +160,9 @@ def block_forward(
 
 Typical structure:
 1. `prepare_rope_and_heads(model)` — checks head_dim, pads if needed, creates `PrecomputedRotaryEmbedding`
-2. `patch_rmsnorm(ModelRMSNorm)`
-3. `pad_lm_head(model)`
-4. Compile blocks: `model._spyre_compiled_blocks = [_make_compiled_block(l) for l in get_backbone(model).layers]`
+2. `pad_lm_head(model)`
+3. Compile blocks: `model._spyre_compiled_blocks = [_make_compiled_block(l) for l in get_backbone(model).layers]`
+4. Compile the final norm: `model._spyre_compiled_norm = torch.compile(get_backbone(model).norm, dynamic=False)`
 
 Loading and generation are handled by `AutoSpyreModelForCausalLM`
 — adapters no longer need `load_model`/`generate` wrappers.
