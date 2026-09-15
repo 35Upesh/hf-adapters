@@ -380,6 +380,12 @@ EMBEDDING_MODELS = {
         "is_gated": True,
         "size": "0.3b",
     },
+    "unsloth_embeddinggemma": {
+        "name": "Non-gated EmbeddingGemma",
+        "path": "unsloth/embeddinggemma-300m",
+        "adapter": "hf_gemma3.py",
+        "size": "0.270b",
+    },
     # hf_qwen3.py
     "qwen3_embed": {
         "name": "Qwen3-Embedding 0.6B",
